@@ -5,15 +5,26 @@ import { CANDIDATE, SCORING_SYSTEM_PROMPT, DEFENSE_PRIMES, CLEARANCE_KEYWORDS } 
 
 const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 
-// Search Indeed via Anthropic MCP proxy (authorized API access)
+// Search Indeed via Anthropic MCP connector (beta API)
 async function searchIndeed(query: string): Promise<any[]> {
   try {
     console.log(`[scan] MCP search: "${query}"`);
-    const response = await client.messages.create({
+    const response = await client.beta.messages.create({
       model: "claude-sonnet-4-20250514",
       max_tokens: 2000,
+      betas: ["mcp-client-2025-11-20"],
       mcp_servers: [
-        { type: "url", url: "https://mcp.indeed.com/claude/mcp", name: "indeed-mcp" } as any
+        {
+          type: "url",
+          url: "https://mcp.indeed.com/claude/mcp",
+          name: "indeed-mcp",
+        }
+      ],
+      tools: [
+        {
+          type: "mcp_toolset",
+          mcp_server_name: "indeed-mcp",
+        }
       ],
       messages: [{
         role: "user",
