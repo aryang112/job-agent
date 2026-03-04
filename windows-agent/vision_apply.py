@@ -1,10 +1,14 @@
 """Claude Vision-based ATS form filling for non-Indeed applications."""
 import base64
+import io
 import json
 import anthropic
+from PIL import Image
 from playwright.sync_api import Page
 from field_mapper import CANDIDATE, get_field_value
 from logger import log
+
+MAX_SCREENSHOT_DIMENSION = 7500  # Claude Vision max is 8000px
 
 
 class VisionApplicator:
@@ -30,9 +34,8 @@ class VisionApplicator:
 
             max_iterations = 15
             for iteration in range(max_iterations):
-                # Screenshot full page so we see buttons at the bottom
-                screenshot = page.screenshot(type="png", full_page=True)
-                b64_image = base64.b64encode(screenshot).decode()
+                # Screenshot and resize to stay within Claude's 8000px limit
+                b64_image = self._take_screenshot(page)
 
                 # Check for blockers
                 page_text = page.inner_text("body").lower()
@@ -70,6 +73,22 @@ class VisionApplicator:
         except Exception as e:
             result["error"] = str(e)[:200]
             return result
+
+    def _take_screenshot(self, page: Page) -> str:
+        """Take a full-page screenshot, resizing if it exceeds Claude's 8000px limit."""
+        raw = page.screenshot(type="png", full_page=True)
+        img = Image.open(io.BytesIO(raw))
+        w, h = img.size
+
+        if w > MAX_SCREENSHOT_DIMENSION or h > MAX_SCREENSHOT_DIMENSION:
+            scale = min(MAX_SCREENSHOT_DIMENSION / w, MAX_SCREENSHOT_DIMENSION / h)
+            new_w, new_h = int(w * scale), int(h * scale)
+            img = img.resize((new_w, new_h), Image.LANCZOS)
+            log.info(f"Resized screenshot from {w}x{h} to {new_w}x{new_h}")
+
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+        return base64.b64encode(buf.getvalue()).decode()
 
     def _analyze_page(self, b64_image: str, job: dict, step: int) -> list[dict]:
         """Send screenshot to Claude Vision and get form-filling actions."""
