@@ -30,8 +30,8 @@ class VisionApplicator:
 
             max_iterations = 15
             for iteration in range(max_iterations):
-                # Screenshot current page
-                screenshot = page.screenshot(type="png")
+                # Screenshot full page so we see buttons at the bottom
+                screenshot = page.screenshot(type="png", full_page=True)
                 b64_image = base64.b64encode(screenshot).decode()
 
                 # Check for blockers
@@ -101,9 +101,19 @@ Return a JSON array of actions to take on this page. Each action:
   "description": "what this field is"
 }}
 
+CRITICAL CSS SELECTOR RULES:
+- Use ONLY standard CSS selectors. NO jQuery pseudo-selectors.
+- NEVER use :contains(), :has-text(), :visible, or any non-standard pseudo-class.
+- For buttons with specific text, use: button[type="submit"], input[type="submit"], or target by ID/class/aria-label.
+  Examples: button[aria-label="Apply"], button.apply-btn, #submit-btn, button[data-testid="apply"]
+- For inputs, use: input[name="..."], input[id="..."], input[type="..."], textarea[name="..."]
+- For dropdowns, use: select[name="..."], select[id="..."]
+- If you cannot determine a precise selector, use a generic one like "button[type='submit']" or describe by index: "button >> nth=0"
+
 Rules:
 - Fill visible form fields with candidate data
-- Click "Next", "Continue", or "Submit" buttons when form is filled
+- Click "Next", "Continue", "Apply", or "Submit" buttons when form is filled
+- If the page needs to be scrolled down to see a button (e.g. "Apply Now" at the bottom), return a scroll action: {{"selector": "body", "action": "scroll", "value": "down", "description": "Scroll down to reveal Apply button"}}
 - For file upload fields, use action "upload"
 - For questions you can't answer with the data provided, use action "skip"
 - For salary fields, skip them (leave blank)
@@ -130,6 +140,49 @@ Rules:
             log.error(f"Vision analysis failed: {e}")
             return []
 
+    def _sanitize_selector(self, selector: str) -> str:
+        """Remove invalid jQuery pseudo-selectors that Playwright doesn't support."""
+        import re
+        # Remove :contains("..."), :has-text("..."), :visible, etc.
+        sanitized = re.sub(r':contains\(["\']?[^)]*["\']?\)', '', selector)
+        sanitized = re.sub(r':has-text\(["\']?[^)]*["\']?\)', '', sanitized)
+        sanitized = re.sub(r':visible', '', sanitized)
+        sanitized = re.sub(r':first', '', sanitized)
+        sanitized = sanitized.strip().rstrip(',')
+        return sanitized if sanitized else selector
+
+    def _find_element(self, page: Page, selector: str, desc: str):
+        """Try to find element with fallback strategies."""
+        # First try the given selector (sanitized)
+        clean = self._sanitize_selector(selector)
+        try:
+            el = page.locator(clean).first
+            if el.is_visible(timeout=2000):
+                return el
+        except Exception:
+            pass
+
+        # Fallback: try to find by text content in description
+        desc_lower = (desc or "").lower()
+        if any(kw in desc_lower for kw in ["apply", "submit", "next", "continue"]):
+            # Try common button patterns
+            for fallback in [
+                "button[type='submit']", "input[type='submit']",
+                "button.btn-primary", "a.apply-button",
+                "button >> text=Apply", "button >> text=Submit",
+                "button >> text=Next", "button >> text=Continue",
+            ]:
+                try:
+                    el = page.locator(fallback).first
+                    if el.is_visible(timeout=1000):
+                        log.info(f"Fallback selector matched: {fallback}")
+                        return el
+                except Exception:
+                    continue
+
+        log.warning(f"Element not found with any strategy: {clean}")
+        return None
+
     def _execute_action(self, page: Page, action: dict, resume_path: str, job: dict, result: dict) -> bool:
         """Execute a single action from Claude Vision's instructions."""
         try:
@@ -141,10 +194,25 @@ Rules:
             if act == "skip":
                 return False
 
-            element = page.locator(selector).first
-            if not element.is_visible(timeout=2000):
-                log.warning(f"Element not visible: {selector}")
+            # Handle scroll action
+            if act == "scroll":
+                direction = (value or "down").lower()
+                if direction == "down":
+                    page.evaluate("window.scrollBy(0, 600)")
+                elif direction == "up":
+                    page.evaluate("window.scrollBy(0, -600)")
+                elif direction == "bottom":
+                    page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                log.info(f"Scrolled {direction}: {desc}")
+                page.wait_for_timeout(1000)
+                return True
+
+            element = self._find_element(page, selector, desc)
+            if not element:
                 return False
+
+            # Scroll element into view before interacting
+            element.scroll_into_view_if_needed(timeout=3000)
 
             if act == "fill":
                 # Check if this is a question that needs notes
