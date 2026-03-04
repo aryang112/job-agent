@@ -5,79 +5,47 @@ import { CANDIDATE, SCORING_SYSTEM_PROMPT, DEFENSE_PRIMES, CLEARANCE_KEYWORDS } 
 
 const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 
-// Search Indeed by scraping public search results
+// Search Indeed via Anthropic MCP proxy (authorized API access)
 async function searchIndeed(query: string): Promise<any[]> {
   try {
-    const params = new URLSearchParams({
-      q: query,
-      l: "remote",
-      remotejob: "032b3046-06a3-4876-8dfd-474eb5e7ed11",
-      sort: "date",
-      limit: "10",
-    });
-    const url = `https://www.indeed.com/jobs?${params}`;
-    console.log(`[scan] Fetching: ${url}`);
-
-    const res = await fetch(url, {
-      headers: {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Accept": "text/html,application/xhtml+xml",
-        "Accept-Language": "en-US,en;q=0.9",
-      },
-    });
-
-    if (!res.ok) {
-      console.error(`[scan] Indeed returned ${res.status} for "${query}"`);
-      return [];
-    }
-
-    const html = await res.text();
-    console.log(`[scan] Got ${html.length} chars of HTML for "${query}"`);
-
-    // Extract job data from Indeed's embedded JSON (window.mosaic.providerData)
-    const scriptMatch = html.match(/window\.mosaic\.providerData\["mosaic-provider-jobcards"\]\s*=\s*(\{[\s\S]*?\});\s*<\/script>/);
-    if (scriptMatch) {
-      const data = JSON.parse(scriptMatch[1]);
-      const results = data?.metaData?.mosaicProviderJobCardsModel?.results || [];
-      return results.map((r: any) => ({
-        job_id: r.jobkey,
-        title: r.title || r.displayTitle,
-        company: r.company,
-        location: r.formattedLocation || r.jobLocationCity || "Remote",
-        salary: r.extractedSalary ? `$${r.extractedSalary.min?.toLocaleString() || ""}–$${r.extractedSalary.max?.toLocaleString() || ""}` : r.salarySnippet?.text || null,
-        url: `https://www.indeed.com/viewjob?jk=${r.jobkey}`,
-        description: r.snippet || "",
-      }));
-    }
-
-    // Fallback: use Claude to extract jobs from HTML
-    console.log(`[scan] No embedded JSON found, using Claude to parse HTML for "${query}"`);
-    const truncatedHtml = html.slice(0, 15000);
+    console.log(`[scan] MCP search: "${query}"`);
     const response = await client.messages.create({
       model: "claude-sonnet-4-20250514",
       max_tokens: 2000,
+      mcp_servers: [
+        { type: "url", url: "https://mcp.indeed.com/claude/mcp", name: "indeed-mcp" } as any
+      ],
       messages: [{
         role: "user",
-        content: `Extract job listings from this Indeed HTML. Return a JSON array. Each object: job_id, title, company, location, salary (or null), url, description (snippet). Return ONLY the JSON array.\n\nHTML:\n${truncatedHtml}`
+        content: `Search Indeed for: "${query}" remote jobs in the United States. Return top 6 results as a JSON array. Each object must include: job_id, title, company, location, salary (or null), url, description (full text from the posting). Return ONLY the JSON array, no other text.`
       }]
-    });
+    } as any);
 
     const text = (response.content || [])
       .filter((b: any) => b.type === "text")
       .map((b: any) => b.text)
-      .join("")
-      .replace(/```json|```/g, "")
-      .trim();
+      .join("");
 
-    const arrMatch = text.match(/\[[\s\S]*\]/);
-    if (arrMatch) {
-      return JSON.parse(arrMatch[0]);
+    // Also check mcp_tool_result blocks
+    const mcpResults = (response.content || [])
+      .filter((b: any) => b.type === "mcp_tool_result")
+      .flatMap((b: any) => b.content || [])
+      .filter((b: any) => b.type === "text")
+      .map((b: any) => b.text)
+      .join("\n");
+
+    const combined = mcpResults || text;
+    console.log(`[scan] Query: "${query}" — response types:`, (response.content || []).map((b: any) => b.type));
+    console.log(`[scan] Combined text (first 500):`, combined.slice(0, 500));
+
+    const match = combined.match(/\[[\s\S]*\]/);
+    if (match) {
+      return JSON.parse(match[0]);
     }
-
-    console.log(`[scan] Could not extract jobs for "${query}"`);
+    console.log(`[scan] No JSON array found for "${query}"`);
     return [];
   } catch (err: any) {
-    console.error(`[scan] Indeed search failed for "${query}":`, err?.message || err);
+    console.error(`[scan] Indeed MCP search failed for "${query}":`, err?.message || err);
     return [];
   }
 }

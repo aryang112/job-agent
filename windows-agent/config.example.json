@@ -1,0 +1,21 @@
+{
+  "anthropic_api_key": "sk-ant-...",
+  "supabase_url": "https://your-project.supabase.co",
+  "supabase_service_key": "eyJ...",
+  "resume_path": "C:\\Users\\14432\\Documents\\Resume\\Aryan_Gupta_Backend_SDETResume.docx",
+  "linkedin_url": "",
+  "throttle": {
+    "min_delay_seconds": 45,
+    "max_delay_seconds": 90,
+    "pause_every_n": 10,
+    "pause_duration_seconds": 300,
+    "max_daily": 100,
+    "active_hours_start": 6,
+    "active_hours_end": 23
+  },
+  "retry": {
+    "max_attempts": 3,
+    "delay_seconds": 30
+  },
+  "poll_interval_seconds": 300
+}

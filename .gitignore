@@ -3,3 +3,8 @@ node_modules/
 .env.local
 .env
 *.log
+windows-agent/config.json
+windows-agent/__pycache__/
+__pycache__/
+*.pyc
+tsconfig.tsbuildinfo
