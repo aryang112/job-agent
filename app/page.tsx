@@ -108,13 +108,40 @@ export default function Dashboard() {
     });
   };
 
+  const scoreNextJob = async (): Promise<boolean> => {
+    try {
+      const r = await fetch("/api/score");
+      const d = await r.json();
+      if (d.done) return false;
+      if (d.scored) {
+        setScanMsg(`Scored: ${d.job?.title} (${d.job?.score}) — ${d.remaining} left`);
+        return d.remaining > 0;
+      }
+      return false;
+    } catch {
+      return false;
+    }
+  };
+
   const triggerScan = async () => {
     setScanning(true);
-    setScanMsg("Scanning Indeed...");
+    setScanMsg("Fetching jobs...");
     try {
       const r = await fetch("/api/scan", { method: "POST" });
       const d = await r.json();
-      setScanMsg(`Done. ${d.jobs_new || 0} new, ${d.jobs_queued || 0} queued.`);
+      const newCount = d.jobs_new || 0;
+      setScanMsg(`Found ${newCount} new jobs. Scoring...`);
+      fetchJobs();
+
+      // Score jobs one at a time (each call is under 10s)
+      let hasMore = newCount > 0;
+      while (hasMore) {
+        hasMore = await scoreNextJob();
+        fetchJobs();
+        fetchStats();
+      }
+
+      setScanMsg(`Done. ${newCount} jobs found and scored.`);
       fetchStats();
       fetchJobs();
     } catch {

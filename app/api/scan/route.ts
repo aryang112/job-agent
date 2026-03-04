@@ -1,9 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
-import Anthropic from "@anthropic-ai/sdk";
 import { supabaseAdmin } from "@/lib/supabase";
-import { CANDIDATE, SCORING_SYSTEM_PROMPT, DEFENSE_PRIMES, CLEARANCE_KEYWORDS } from "@/lib/profile";
-
-const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+import { CANDIDATE, DEFENSE_PRIMES, CLEARANCE_KEYWORDS } from "@/lib/profile";
 
 // Search jobs via JSearch (RapidAPI)
 async function searchJobs(query: string): Promise<any[]> {
@@ -53,37 +50,6 @@ async function searchJobs(query: string): Promise<any[]> {
   }
 }
 
-// Score a job against candidate profile using Claude
-async function scoreJob(job: any): Promise<any> {
-  try {
-    const jobText = `
-Title: ${job.title}
-Company: ${job.company}
-Location: ${job.location || "Not specified"}
-Salary: ${job.salary || "Not listed"}
-Description: ${(job.description || "").slice(0, 3000)}
-    `.trim();
-
-    const response = await client.messages.create({
-      model: "claude-sonnet-4-20250514",
-      max_tokens: 800,
-      system: SCORING_SYSTEM_PROMPT,
-      messages: [{ role: "user", content: jobText }]
-    });
-
-    const text = (response.content || [])
-      .filter((b: any) => b.type === "text")
-      .map((b: any) => b.text)
-      .join("")
-      .replace(/```json|```/g, "")
-      .trim();
-
-    return JSON.parse(text);
-  } catch {
-    return null;
-  }
-}
-
 // Check if company name matches a defense prime contractor
 function isDefensePrime(company: string): boolean {
   const lower = company.toLowerCase();
@@ -109,6 +75,7 @@ function detectAtsType(url: string): string {
   return "unknown";
 }
 
+// GET/POST /api/scan — fetch jobs from JSearch and save to Supabase (no scoring)
 export async function GET(req: NextRequest) {
   const authHeader = req.headers.get("authorization");
   const isVercelCron = req.headers.get("x-vercel-cron") === "1";
@@ -123,7 +90,7 @@ export async function GET(req: NextRequest) {
     return NextResponse.json({ error: "RAPIDAPI_KEY not configured" }, { status: 500 });
   }
 
-  const results = { jobs_found: 0, jobs_new: 0, jobs_queued: 0, queries_run: [] as string[] };
+  const results = { jobs_found: 0, jobs_new: 0, queries_run: [] as string[] };
   const allJobs: any[] = [];
 
   // Run all search queries
@@ -131,8 +98,7 @@ export async function GET(req: NextRequest) {
     results.queries_run.push(query);
     const jobs = await searchJobs(query);
     allJobs.push(...jobs);
-    // Respect rate limits
-    await new Promise(r => setTimeout(r, 1000));
+    await new Promise(r => setTimeout(r, 500));
   }
 
   results.jobs_found = allJobs.length;
@@ -156,47 +122,14 @@ export async function GET(req: NextRequest) {
 
   const newJobs = unique.filter(j => !existingIds.has(j.job_id));
 
-  // Score and insert new jobs
+  // Insert new jobs WITHOUT scoring (stays under 10s Vercel timeout)
   for (const job of newJobs) {
-    const analysis = await scoreJob(job);
-    if (!analysis) continue;
-
-    let score = analysis.score || 0;
     const company = job.company || "";
     const description = job.description || "";
-
-    // Server-side federal detection
     const defensePrime = isDefensePrime(company);
-    const federal = defensePrime || analysis.is_federal === true;
-    const clearanceMentioned = hasClearanceKeywords(description) || analysis.clearance_mentioned === true;
+    const federal = defensePrime || hasClearanceKeywords(description);
+    const clearanceMentioned = hasClearanceKeywords(description);
     const atsType = detectAtsType(job.url || "");
-
-    // Score boosts for defense/federal
-    if (defensePrime) {
-      score = Math.max(score + 20, 80);
-    } else if (federal) {
-      score = Math.max(score + 15, 75);
-    }
-    if (clearanceMentioned) {
-      score = Math.min(score + 10, 100);
-    }
-
-    // Discard below 60
-    if (score < 60) continue;
-
-    // Auto-status assignment
-    let status = "new";
-    let queuedAt: string | null = null;
-
-    if (score >= 85) {
-      status = "queued_to_apply";
-      queuedAt = new Date().toISOString();
-      results.jobs_queued++;
-    } else if (score >= 75 && federal) {
-      status = "queued_to_apply";
-      queuedAt = new Date().toISOString();
-      results.jobs_queued++;
-    }
 
     await supabaseAdmin.from("jobs").upsert({
       id: job.job_id,
@@ -206,40 +139,38 @@ export async function GET(req: NextRequest) {
       salary: job.salary || null,
       url: job.url || null,
       description: description.slice(0, 5000),
-      score,
-      verdict: score >= 85 ? "STRONG FIT" : score >= 70 ? "GOOD FIT" : score >= 50 ? "WEAK FIT" : "NO FIT",
-      match_reasons: analysis.match_reasons || [],
-      gaps: analysis.gaps || [],
-      key_requirements: analysis.key_requirements || [],
-      salary_estimate: analysis.salary_estimate || null,
-      quick_pitch: analysis.quick_pitch || null,
-      apply_recommendation: analysis.apply_recommendation,
-      status,
+      score: null,  // Unscored — will be scored by /api/score
+      verdict: null,
+      match_reasons: [],
+      gaps: [],
+      key_requirements: [],
+      salary_estimate: null,
+      quick_pitch: null,
+      apply_recommendation: null,
+      status: "new",
       search_query: job.search_query,
       found_at: new Date().toISOString(),
       is_federal: federal,
       is_defense_prime: defensePrime,
       clearance_mentioned: clearanceMentioned,
       ats_type: atsType,
-      queued_at: queuedAt,
     });
 
     results.jobs_new++;
-    await new Promise(r => setTimeout(r, 300));
   }
 
   // Log the scan
   await supabaseAdmin.from("scan_log").insert({
     jobs_found: results.jobs_found,
     jobs_new: results.jobs_new,
-    jobs_queued: results.jobs_queued,
+    jobs_queued: 0,
     queries_run: results.queries_run
   });
 
   return NextResponse.json({
     success: true,
     ...results,
-    debug: `Found ${allJobs.length} raw, ${unique.length} unique, ${newJobs.length} new, ${results.jobs_queued} queued`
+    debug: `Found ${allJobs.length} raw, ${unique.length} unique, ${newJobs.length} new (unscored)`
   });
 }
 
