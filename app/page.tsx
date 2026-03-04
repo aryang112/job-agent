@@ -63,10 +63,7 @@ export default function Dashboard() {
     setScanning(true);
     setScanMsg("Scanning Indeed...");
     try {
-      const r = await fetch("/api/scan", {
-        method: "POST",
-        headers: { Authorization: `Bearer ${process.env.NEXT_PUBLIC_CRON_SECRET || ""}` }
-      });
+      const r = await fetch("/api/scan", { method: "POST" });
       const d = await r.json();
       setScanMsg(`Done. ${d.jobs_new || 0} new jobs added.`);
       fetchStats();

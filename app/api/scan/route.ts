@@ -79,12 +79,13 @@ Description: ${(job.description || "").slice(0, 3000)}
 }
 
 export async function GET(req: NextRequest) {
-  // Protect cron endpoint
+  // Protect cron endpoint — allow Vercel cron, bearer token, or logged-in user
   const authHeader = req.headers.get("authorization");
   const isVercelCron = req.headers.get("x-vercel-cron") === "1";
   const isManual = authHeader === `Bearer ${process.env.CRON_SECRET}`;
+  const isLoggedIn = req.cookies.get("auth_token")?.value === process.env.AUTH_SECRET;
 
-  if (!isVercelCron && !isManual) {
+  if (!isVercelCron && !isManual && !isLoggedIn) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
 

@@ -3,10 +3,18 @@ import { NextRequest, NextResponse } from "next/server";
 export function middleware(req: NextRequest) {
   const { pathname } = req.nextUrl;
 
-  // Allow login page and auth API
-  // Allow login page, auth API, and scan endpoint (has its own auth)
-  if (pathname === "/login" || pathname === "/api/auth" || pathname === "/api/scan") {
+  // Allow login page and auth API without cookie
+  if (pathname === "/login" || pathname === "/api/auth") {
     return NextResponse.next();
+  }
+
+  // Allow scan endpoint for Vercel cron (no cookie, uses bearer token)
+  if (pathname === "/api/scan") {
+    const hasCookie = req.cookies.get("auth_token")?.value === process.env.AUTH_SECRET;
+    const hasCron = req.headers.get("x-vercel-cron") === "1";
+    const hasBearer = req.headers.get("authorization") === `Bearer ${process.env.CRON_SECRET}`;
+    if (hasCookie || hasCron || hasBearer) return NextResponse.next();
+    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
 
   // Check auth cookie
