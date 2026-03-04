@@ -4,7 +4,8 @@ export function middleware(req: NextRequest) {
   const { pathname } = req.nextUrl;
 
   // Allow login page and auth API
-  if (pathname === "/login" || pathname === "/api/auth") {
+  // Allow login page, auth API, and scan endpoint (has its own auth)
+  if (pathname === "/login" || pathname === "/api/auth" || pathname === "/api/scan") {
     return NextResponse.next();
   }
 
