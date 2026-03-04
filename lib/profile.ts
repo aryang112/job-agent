@@ -39,12 +39,12 @@ export const CANDIDATE = {
   },
 
   search_queries: [
-    "SDET",
     "QA Engineer",
-    "QA Automation Engineer",
-    "Test Lead",
-    "Automation Engineer",
-    "Software Engineer in Test",
+    "QA Engineer public trust",
+    "API Testing",
+    "Tester",
+    "QA public trust",
+    "SDET",
   ]
 };
 
