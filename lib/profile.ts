@@ -39,13 +39,10 @@ export const CANDIDATE = {
   },
 
   search_queries: [
-    "Senior QA Automation Engineer remote",
-    "SDET Java Selenium remote",
-    "Test Lead federal government remote",
-    "Backend SDET microservices Java remote",
-    "Senior Automation Engineer Playwright remote",
-    "QA Lead AWS federal contractor remote",
-    "IT Consultant QA federal subcontractor remote"
+    "QA Engineer remote",
+    "SDET remote",
+    "Test Lead remote",
+    "Automation Engineer remote"
   ]
 };
 

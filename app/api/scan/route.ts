@@ -34,15 +34,18 @@ async function searchIndeed(query: string): Promise<any[]> {
       .join("\n");
 
     const combined = mcpResults || text;
+    console.log(`[scan] Query: "${query}" — raw response content types:`, (response.content || []).map((b: any) => b.type));
+    console.log(`[scan] Combined text (first 500 chars):`, combined.slice(0, 500));
 
     // Try to extract JSON array
     const match = combined.match(/\[[\s\S]*\]/);
     if (match) {
       return JSON.parse(match[0]);
     }
+    console.log(`[scan] No JSON array found for "${query}"`);
     return [];
-  } catch (err) {
-    console.error(`Indeed search failed for "${query}":`, err);
+  } catch (err: any) {
+    console.error(`[scan] Indeed search failed for "${query}":`, err?.message || err);
     return [];
   }
 }
@@ -162,7 +165,7 @@ export async function GET(req: NextRequest) {
     queries_run: results.queries_run
   });
 
-  return NextResponse.json({ success: true, ...results });
+  return NextResponse.json({ success: true, ...results, debug: `Found ${allJobs.length} raw, ${unique.length} unique, ${newJobs.length} new` });
 }
 
 // Also allow POST for manual trigger from dashboard
