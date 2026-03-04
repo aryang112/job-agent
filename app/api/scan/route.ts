@@ -50,6 +50,47 @@ async function searchJobs(query: string): Promise<any[]> {
   }
 }
 
+// Filter out irrelevant job titles (ServiceNow dev, data analyst, etc.)
+const RELEVANT_TITLE_KEYWORDS = [
+  "qa", "quality assurance", "sdet", "test", "testing", "automation engineer",
+  "software engineer in test", "set ", "quality engineer",
+];
+const IRRELEVANT_TITLE_KEYWORDS = [
+  "servicenow", "service now", "data analyst", "data scientist", "machine learning",
+  "devops", "sre", "site reliability", "network engineer", "hardware",
+  "mechanical", "electrical", "civil", "nurse", "medical", "physician",
+  "accountant", "financial analyst", "marketing", "sales rep", "recruiter",
+  "designer", "ux ", "ui ", "product manager", "scrum master",
+];
+
+function isRelevantJob(title: string, location: string, isRemote: boolean): boolean {
+  const t = (title || "").toLowerCase();
+  const loc = (location || "").toLowerCase();
+
+  // Reject hybrid/on-site
+  if (loc.includes("hybrid") || (!isRemote && !loc.includes("remote"))) {
+    return false;
+  }
+
+  // Reject explicitly irrelevant titles
+  if (IRRELEVANT_TITLE_KEYWORDS.some(kw => t.includes(kw))) {
+    return false;
+  }
+
+  // Accept if title matches relevant keywords
+  if (RELEVANT_TITLE_KEYWORDS.some(kw => t.includes(kw))) {
+    return true;
+  }
+
+  // Accept if title contains general software/dev keywords (may be relevant)
+  if (["software", "developer", "engineer", "backend", "java", "api"].some(kw => t.includes(kw))) {
+    return true;
+  }
+
+  // Reject everything else — too far from QA/SDET domain
+  return false;
+}
+
 // Check if company name matches a defense prime contractor
 function isDefensePrime(company: string): boolean {
   const lower = company.toLowerCase();
@@ -112,15 +153,19 @@ export async function GET(req: NextRequest) {
     return true;
   });
 
+  // Filter out irrelevant jobs (wrong title, hybrid/on-site)
+  const relevant = unique.filter(j => isRelevantJob(j.title, j.location, true));
+  console.log(`[scan] ${unique.length} unique → ${relevant.length} relevant (${unique.length - relevant.length} filtered out)`);
+
   // Check which ones are already in DB
-  const ids = unique.map(j => j.job_id).filter(Boolean);
+  const ids = relevant.map(j => j.job_id).filter(Boolean);
   const { data: existing } = await supabaseAdmin
     .from("jobs")
     .select("id")
     .in("id", ids);
   const existingIds = new Set((existing || []).map((r: any) => r.id));
 
-  const newJobs = unique.filter(j => !existingIds.has(j.job_id));
+  const newJobs = relevant.filter(j => !existingIds.has(j.job_id));
 
   // Insert new jobs WITHOUT scoring (stays under 10s Vercel timeout)
   for (const job of newJobs) {
@@ -170,7 +215,8 @@ export async function GET(req: NextRequest) {
   return NextResponse.json({
     success: true,
     ...results,
-    debug: `Found ${allJobs.length} raw, ${unique.length} unique, ${newJobs.length} new (unscored)`
+    jobs_filtered: unique.length - relevant.length,
+    debug: `Found ${allJobs.length} raw, ${unique.length} unique, ${relevant.length} relevant, ${newJobs.length} new (unscored)`
   });
 }
 

@@ -108,5 +108,6 @@ Federal/Defense Scoring Rules:
 - Public Trust clearance is a strong match for most federal roles.
 - Do NOT penalize for salary if not listed or if below preference — many federal roles have strong total comp.
 
-Penalize heavily for: on-site only, requires clearance candidate doesn't hold (TS/SCI, Secret), irrelevant domain (healthcare coding, non-tech).
+Penalize heavily for: on-site only, hybrid, requires clearance candidate doesn't hold (TS/SCI, Secret), irrelevant domain (healthcare coding, non-tech), non-QA/testing roles (ServiceNow developer, data analyst, network engineer, etc.).
+Score below 30 for jobs that are clearly not QA/SDET/testing/automation roles.
 Reward: Java/Selenium/Playwright, federal/GovCon, AWS, microservices, remote, Public Trust, test leadership.`;
