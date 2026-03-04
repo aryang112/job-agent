@@ -1,48 +1,80 @@
 import { NextRequest, NextResponse } from "next/server";
 import Anthropic from "@anthropic-ai/sdk";
 import { supabaseAdmin } from "@/lib/supabase";
-import { CANDIDATE, SCORING_SYSTEM_PROMPT } from "@/lib/profile";
+import { CANDIDATE, SCORING_SYSTEM_PROMPT, DEFENSE_PRIMES, CLEARANCE_KEYWORDS } from "@/lib/profile";
 
 const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 
-// Search Indeed via Anthropic MCP proxy
+// Search Indeed by scraping public search results
 async function searchIndeed(query: string): Promise<any[]> {
   try {
+    const params = new URLSearchParams({
+      q: query,
+      l: "remote",
+      remotejob: "032b3046-06a3-4876-8dfd-474eb5e7ed11",
+      sort: "date",
+      limit: "10",
+    });
+    const url = `https://www.indeed.com/jobs?${params}`;
+    console.log(`[scan] Fetching: ${url}`);
+
+    const res = await fetch(url, {
+      headers: {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml",
+        "Accept-Language": "en-US,en;q=0.9",
+      },
+    });
+
+    if (!res.ok) {
+      console.error(`[scan] Indeed returned ${res.status} for "${query}"`);
+      return [];
+    }
+
+    const html = await res.text();
+    console.log(`[scan] Got ${html.length} chars of HTML for "${query}"`);
+
+    // Extract job data from Indeed's embedded JSON (window.mosaic.providerData)
+    const scriptMatch = html.match(/window\.mosaic\.providerData\["mosaic-provider-jobcards"\]\s*=\s*(\{[\s\S]*?\});\s*<\/script>/);
+    if (scriptMatch) {
+      const data = JSON.parse(scriptMatch[1]);
+      const results = data?.metaData?.mosaicProviderJobCardsModel?.results || [];
+      return results.map((r: any) => ({
+        job_id: r.jobkey,
+        title: r.title || r.displayTitle,
+        company: r.company,
+        location: r.formattedLocation || r.jobLocationCity || "Remote",
+        salary: r.extractedSalary ? `$${r.extractedSalary.min?.toLocaleString() || ""}–$${r.extractedSalary.max?.toLocaleString() || ""}` : r.salarySnippet?.text || null,
+        url: `https://www.indeed.com/viewjob?jk=${r.jobkey}`,
+        description: r.snippet || "",
+      }));
+    }
+
+    // Fallback: use Claude to extract jobs from HTML
+    console.log(`[scan] No embedded JSON found, using Claude to parse HTML for "${query}"`);
+    const truncatedHtml = html.slice(0, 15000);
     const response = await client.messages.create({
       model: "claude-sonnet-4-20250514",
       max_tokens: 2000,
-      mcp_servers: [
-        { type: "url", url: "https://mcp.indeed.com/claude/mcp", name: "indeed-mcp" } as any
-      ],
       messages: [{
         role: "user",
-        content: `Search Indeed for: "${query}". Return top 6 remote jobs as a JSON array. Each object must include: job_id, title, company, location, salary (or null), url, description (full text from the posting). Return ONLY the JSON array, no other text.`
+        content: `Extract job listings from this Indeed HTML. Return a JSON array. Each object: job_id, title, company, location, salary (or null), url, description (snippet). Return ONLY the JSON array.\n\nHTML:\n${truncatedHtml}`
       }]
-    } as any);
+    });
 
     const text = (response.content || [])
       .filter((b: any) => b.type === "text")
       .map((b: any) => b.text)
-      .join("");
+      .join("")
+      .replace(/```json|```/g, "")
+      .trim();
 
-    // Also check mcp_tool_result blocks
-    const mcpResults = (response.content || [])
-      .filter((b: any) => b.type === "mcp_tool_result")
-      .flatMap((b: any) => b.content || [])
-      .filter((b: any) => b.type === "text")
-      .map((b: any) => b.text)
-      .join("\n");
-
-    const combined = mcpResults || text;
-    console.log(`[scan] Query: "${query}" — raw response content types:`, (response.content || []).map((b: any) => b.type));
-    console.log(`[scan] Combined text (first 500 chars):`, combined.slice(0, 500));
-
-    // Try to extract JSON array
-    const match = combined.match(/\[[\s\S]*\]/);
-    if (match) {
-      return JSON.parse(match[0]);
+    const arrMatch = text.match(/\[[\s\S]*\]/);
+    if (arrMatch) {
+      return JSON.parse(arrMatch[0]);
     }
-    console.log(`[scan] No JSON array found for "${query}"`);
+
+    console.log(`[scan] Could not extract jobs for "${query}"`);
     return [];
   } catch (err: any) {
     console.error(`[scan] Indeed search failed for "${query}":`, err?.message || err);
@@ -50,7 +82,7 @@ async function searchIndeed(query: string): Promise<any[]> {
   }
 }
 
-// Score a job against Aryan's profile using Claude
+// Score a job against candidate profile using Claude
 async function scoreJob(job: any): Promise<any> {
   try {
     const jobText = `
@@ -81,8 +113,32 @@ Description: ${(job.description || "").slice(0, 3000)}
   }
 }
 
+// Check if company name matches a defense prime contractor
+function isDefensePrime(company: string): boolean {
+  const lower = company.toLowerCase();
+  return DEFENSE_PRIMES.some(prime => lower.includes(prime.toLowerCase()));
+}
+
+// Check if description mentions clearance keywords
+function hasClearanceKeywords(description: string): boolean {
+  const lower = (description || "").toLowerCase();
+  return CLEARANCE_KEYWORDS.some(kw => lower.includes(kw));
+}
+
+// Detect ATS type from URL
+function detectAtsType(url: string): string {
+  if (!url) return "unknown";
+  const u = url.toLowerCase();
+  if (u.includes("indeed.com/applystart") || u.includes("indeed.com/viewjob")) return "easy_apply";
+  if (u.includes("myworkdayjobs.com") || u.includes("workday.com")) return "workday";
+  if (u.includes("boards.greenhouse.io") || u.includes("greenhouse.io")) return "greenhouse";
+  if (u.includes("lever.co") || u.includes("jobs.lever.co")) return "lever";
+  if (u.includes("icims.com")) return "icims";
+  if (u.includes("taleo.net")) return "taleo";
+  return "unknown";
+}
+
 export async function GET(req: NextRequest) {
-  // Protect cron endpoint — allow Vercel cron, bearer token, or logged-in user
   const authHeader = req.headers.get("authorization");
   const isVercelCron = req.headers.get("x-vercel-cron") === "1";
   const isManual = authHeader === `Bearer ${process.env.CRON_SECRET}`;
@@ -92,7 +148,7 @@ export async function GET(req: NextRequest) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
 
-  const results = { jobs_found: 0, jobs_new: 0, queries_run: [] as string[] };
+  const results = { jobs_found: 0, jobs_new: 0, jobs_queued: 0, queries_run: [] as string[] };
   const allJobs: any[] = [];
 
   // Run all search queries
@@ -100,7 +156,6 @@ export async function GET(req: NextRequest) {
     results.queries_run.push(query);
     const jobs = await searchIndeed(query);
     allJobs.push(...jobs.map(j => ({ ...j, search_query: query })));
-    // Small delay to be respectful
     await new Promise(r => setTimeout(r, 500));
   }
 
@@ -130,8 +185,44 @@ export async function GET(req: NextRequest) {
     const analysis = await scoreJob(job);
     if (!analysis) continue;
 
-    // Only save if score >= 60 (weak fit or better)
-    if (analysis.score < 60) continue;
+    let score = analysis.score || 0;
+    const company = job.company || "";
+    const description = job.description || "";
+
+    // Server-side federal detection
+    const defensePrime = isDefensePrime(company);
+    const federal = defensePrime || analysis.is_federal === true;
+    const clearanceMentioned = hasClearanceKeywords(description) || analysis.clearance_mentioned === true;
+    const atsType = detectAtsType(job.url || "");
+
+    // Score boosts for defense/federal
+    if (defensePrime) {
+      score = Math.max(score + 20, 80);
+    } else if (federal) {
+      score = Math.max(score + 15, 75);
+    }
+    if (clearanceMentioned) {
+      score = Math.min(score + 10, 100);
+    }
+
+    // Discard below 60
+    if (score < 60) continue;
+
+    // Auto-status assignment
+    let status = "new";
+    let queuedAt: string | null = null;
+
+    if (score >= 85) {
+      status = "queued_to_apply";
+      queuedAt = new Date().toISOString();
+      results.jobs_queued++;
+    } else if (score >= 75 && federal) {
+      status = "queued_to_apply";
+      queuedAt = new Date().toISOString();
+      results.jobs_queued++;
+    }
+    // 75-84 non-federal → "new" (manual approval)
+    // 60-74 → "new" (save, don't auto-apply)
 
     await supabaseAdmin.from("jobs").upsert({
       id: job.job_id || `${job.title}-${job.company}-${Date.now()}`.replace(/\s+/g, "-").toLowerCase(),
@@ -140,18 +231,23 @@ export async function GET(req: NextRequest) {
       location: job.location || "Remote",
       salary: job.salary || null,
       url: job.url || null,
-      description: (job.description || "").slice(0, 5000),
-      score: analysis.score,
-      verdict: analysis.verdict,
+      description: description.slice(0, 5000),
+      score,
+      verdict: score >= 85 ? "STRONG FIT" : score >= 70 ? "GOOD FIT" : score >= 50 ? "WEAK FIT" : "NO FIT",
       match_reasons: analysis.match_reasons || [],
       gaps: analysis.gaps || [],
       key_requirements: analysis.key_requirements || [],
       salary_estimate: analysis.salary_estimate || null,
       quick_pitch: analysis.quick_pitch || null,
       apply_recommendation: analysis.apply_recommendation,
-      status: "new",
+      status,
       search_query: job.search_query,
-      found_at: new Date().toISOString()
+      found_at: new Date().toISOString(),
+      is_federal: federal,
+      is_defense_prime: defensePrime,
+      clearance_mentioned: clearanceMentioned,
+      ats_type: atsType,
+      queued_at: queuedAt,
     });
 
     results.jobs_new++;
@@ -162,13 +258,17 @@ export async function GET(req: NextRequest) {
   await supabaseAdmin.from("scan_log").insert({
     jobs_found: results.jobs_found,
     jobs_new: results.jobs_new,
+    jobs_queued: results.jobs_queued,
     queries_run: results.queries_run
   });
 
-  return NextResponse.json({ success: true, ...results, debug: `Found ${allJobs.length} raw, ${unique.length} unique, ${newJobs.length} new` });
+  return NextResponse.json({
+    success: true,
+    ...results,
+    debug: `Found ${allJobs.length} raw, ${unique.length} unique, ${newJobs.length} new, ${results.jobs_queued} queued`
+  });
 }
 
-// Also allow POST for manual trigger from dashboard
 export async function POST(req: NextRequest) {
   return GET(req);
 }

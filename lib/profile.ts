@@ -39,12 +39,44 @@ export const CANDIDATE = {
   },
 
   search_queries: [
-    "QA Engineer remote",
-    "SDET remote",
-    "Test Lead remote",
-    "Automation Engineer remote"
+    "SDET",
+    "QA Engineer",
+    "QA Automation Engineer",
+    "Test Lead",
+    "Automation Engineer",
+    "Software Engineer in Test",
   ]
 };
+
+// Defense prime contractors — used for score boosting
+export const DEFENSE_PRIMES = [
+  "Booz Allen", "Booz Allen Hamilton",
+  "Leidos",
+  "SAIC",
+  "GDIT", "General Dynamics IT", "General Dynamics",
+  "Peraton",
+  "Northrop Grumman",
+  "Raytheon",
+  "ManTech",
+  "CACI",
+  "Accenture Federal", "Accenture Federal Services",
+  "Deloitte Federal", "Deloitte",
+  "L3Harris", "L3 Harris",
+  "BAE Systems",
+  "DXC", "DXC Technology",
+  "Maximus",
+  "ICF",
+  "Amentum",
+  "Unison"
+];
+
+// Keywords that indicate clearance requirement/preference
+export const CLEARANCE_KEYWORDS = [
+  "public trust", "secret clearance", "top secret", "ts/sci",
+  "security clearance", "clearance required", "clearance preferred",
+  "suitability", "naci", "mbi", "bi", "moderate risk",
+  "high risk", "position of trust"
+];
 
 export const SCORING_SYSTEM_PROMPT = `You are a job fit analyzer for a senior SDET. Return ONLY valid JSON, no markdown, no backticks.
 
@@ -52,7 +84,7 @@ Candidate: ${CANDIDATE.name}, ${CANDIDATE.citizenship}, ${CANDIDATE.clearance} C
 Title: ${CANDIDATE.title}
 Skills: ${CANDIDATE.skills.join(", ")}
 Experience: ${CANDIDATE.experience.map(e => e.split(":")[0]).join(" | ")}
-Preferences: Remote only, Any US, $${CANDIDATE.preferences.min_salary.toLocaleString()}+, Any employment type
+Preferences: Remote only, Any US, Any employment type (W2, C2C, Federal, Consulting)
 
 Return this exact JSON structure:
 {
@@ -63,9 +95,18 @@ Return this exact JSON structure:
   "gaps": ["<gap>"],
   "key_requirements": ["<req1>", "<req2>", "<req3>"],
   "salary_estimate": "<range or N/A>",
-  "quick_pitch": "<2 sentences tailored to this specific role>"
+  "quick_pitch": "<2 sentences tailored to this specific role>",
+  "is_federal": <true if government/federal/GovCon role>,
+  "clearance_mentioned": <true if any clearance level mentioned>
 }
 
 Score 85+ = STRONG FIT (apply immediately). 70-84 = GOOD FIT. 50-69 = WEAK FIT. Below 50 = NO FIT.
-Penalize heavily for: on-site only, below $130K, requires clearance candidate doesn't hold, irrelevant domain.
-Reward: Java/Selenium/Playwright, federal/GovCon, AWS, microservices, remote, Public Trust.`;
+
+Federal/Defense Scoring Rules:
+- Federal/GovCon roles that match skills: boost score. These are high-priority targets.
+- Defense prime contractors (Booz Allen, Leidos, SAIC, GDIT, Peraton, Northrop Grumman, Raytheon, ManTech, CACI, etc.) are preferred employers — score generously.
+- Public Trust clearance is a strong match for most federal roles.
+- Do NOT penalize for salary if not listed or if below preference — many federal roles have strong total comp.
+
+Penalize heavily for: on-site only, requires clearance candidate doesn't hold (TS/SCI, Secret), irrelevant domain (healthcare coding, non-tech).
+Reward: Java/Selenium/Playwright, federal/GovCon, AWS, microservices, remote, Public Trust, test leadership.`;
