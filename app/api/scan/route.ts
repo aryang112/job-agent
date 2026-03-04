@@ -5,58 +5,50 @@ import { CANDIDATE, SCORING_SYSTEM_PROMPT, DEFENSE_PRIMES, CLEARANCE_KEYWORDS } 
 
 const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 
-// Search Indeed via Anthropic MCP connector (beta API)
-async function searchIndeed(query: string): Promise<any[]> {
+// Search jobs via JSearch (RapidAPI)
+async function searchJobs(query: string): Promise<any[]> {
   try {
-    console.log(`[scan] MCP search: "${query}"`);
-    const response = await client.beta.messages.create({
-      model: "claude-sonnet-4-20250514",
-      max_tokens: 2000,
-      betas: ["mcp-client-2025-11-20"],
-      mcp_servers: [
-        {
-          type: "url",
-          url: "https://mcp.indeed.com/claude/mcp",
-          name: "indeed-mcp",
-        }
-      ],
-      tools: [
-        {
-          type: "mcp_toolset",
-          mcp_server_name: "indeed-mcp",
-        }
-      ],
-      messages: [{
-        role: "user",
-        content: `Search Indeed for: "${query}" remote jobs in the United States. Return top 6 results as a JSON array. Each object must include: job_id, title, company, location, salary (or null), url, description (full text from the posting). Return ONLY the JSON array, no other text.`
-      }]
-    } as any);
+    const params = new URLSearchParams({
+      query: `${query} remote`,
+      page: "1",
+      num_pages: "1",
+      date_posted: "week",
+      remote_jobs_only: "true",
+      country: "US",
+    });
+    const url = `https://jsearch.p.rapidapi.com/search?${params}`;
+    console.log(`[scan] JSearch: "${query}"`);
 
-    const text = (response.content || [])
-      .filter((b: any) => b.type === "text")
-      .map((b: any) => b.text)
-      .join("");
+    const res = await fetch(url, {
+      headers: {
+        "x-rapidapi-key": process.env.RAPIDAPI_KEY || "",
+        "x-rapidapi-host": "jsearch.p.rapidapi.com",
+      },
+    });
 
-    // Also check mcp_tool_result blocks
-    const mcpResults = (response.content || [])
-      .filter((b: any) => b.type === "mcp_tool_result")
-      .flatMap((b: any) => b.content || [])
-      .filter((b: any) => b.type === "text")
-      .map((b: any) => b.text)
-      .join("\n");
-
-    const combined = mcpResults || text;
-    console.log(`[scan] Query: "${query}" — response types:`, (response.content || []).map((b: any) => b.type));
-    console.log(`[scan] Combined text (first 500):`, combined.slice(0, 500));
-
-    const match = combined.match(/\[[\s\S]*\]/);
-    if (match) {
-      return JSON.parse(match[0]);
+    if (!res.ok) {
+      console.error(`[scan] JSearch returned ${res.status} for "${query}"`);
+      return [];
     }
-    console.log(`[scan] No JSON array found for "${query}"`);
-    return [];
+
+    const data = await res.json();
+    const results = data?.data || [];
+    console.log(`[scan] JSearch returned ${results.length} jobs for "${query}"`);
+
+    return results.map((r: any) => ({
+      job_id: r.job_id || `${r.job_title}-${r.employer_name}`.replace(/\s+/g, "-").toLowerCase(),
+      title: r.job_title,
+      company: r.employer_name,
+      location: r.job_city ? `${r.job_city}, ${r.job_state}` : (r.job_is_remote ? "Remote" : "Unknown"),
+      salary: r.job_min_salary && r.job_max_salary
+        ? `$${r.job_min_salary.toLocaleString()}–$${r.job_max_salary.toLocaleString()}`
+        : null,
+      url: r.job_apply_link || r.job_google_link || null,
+      description: (r.job_description || "").slice(0, 5000),
+      search_query: query,
+    }));
   } catch (err: any) {
-    console.error(`[scan] Indeed MCP search failed for "${query}":`, err?.message || err);
+    console.error(`[scan] JSearch failed for "${query}":`, err?.message || err);
     return [];
   }
 }
@@ -127,15 +119,20 @@ export async function GET(req: NextRequest) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
 
+  if (!process.env.RAPIDAPI_KEY) {
+    return NextResponse.json({ error: "RAPIDAPI_KEY not configured" }, { status: 500 });
+  }
+
   const results = { jobs_found: 0, jobs_new: 0, jobs_queued: 0, queries_run: [] as string[] };
   const allJobs: any[] = [];
 
   // Run all search queries
   for (const query of CANDIDATE.search_queries) {
     results.queries_run.push(query);
-    const jobs = await searchIndeed(query);
-    allJobs.push(...jobs.map(j => ({ ...j, search_query: query })));
-    await new Promise(r => setTimeout(r, 500));
+    const jobs = await searchJobs(query);
+    allJobs.push(...jobs);
+    // Respect rate limits
+    await new Promise(r => setTimeout(r, 1000));
   }
 
   results.jobs_found = allJobs.length;
@@ -200,11 +197,9 @@ export async function GET(req: NextRequest) {
       queuedAt = new Date().toISOString();
       results.jobs_queued++;
     }
-    // 75-84 non-federal → "new" (manual approval)
-    // 60-74 → "new" (save, don't auto-apply)
 
     await supabaseAdmin.from("jobs").upsert({
-      id: job.job_id || `${job.title}-${job.company}-${Date.now()}`.replace(/\s+/g, "-").toLowerCase(),
+      id: job.job_id,
       title: job.title,
       company: job.company,
       location: job.location || "Remote",
