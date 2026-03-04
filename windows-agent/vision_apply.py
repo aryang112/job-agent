@@ -1,14 +1,18 @@
-"""Claude Vision-based ATS form filling for non-Indeed applications."""
+"""Claude Vision-based ATS form filling for non-Indeed applications.
+
+Strategy: viewport-based navigation.
+- Always screenshot what's currently visible (1280x~800), never full-page.
+- Claude sees crisp, readable content and decides: fill fields, click buttons, or scroll.
+- Each iteration is one viewport screenshot → actions → next screenshot.
+"""
 import base64
 import io
 import json
+import re
 import anthropic
-from PIL import Image
 from playwright.sync_api import Page
 from field_mapper import CANDIDATE, get_field_value
 from logger import log
-
-MAX_SCREENSHOT_DIMENSION = 7500  # Claude Vision max is 8000px
 
 
 class VisionApplicator:
@@ -30,27 +34,41 @@ class VisionApplicator:
                 return result
 
             page.goto(url, wait_until="domcontentloaded", timeout=30000)
+            page.wait_for_timeout(2000)
             result["pages"] += 1
 
-            max_iterations = 15
-            for iteration in range(max_iterations):
-                # Screenshot and resize to stay within Claude's 8000px limit
-                b64_image = self._take_screenshot(page)
+            max_iterations = 20
+            consecutive_scroll_only = 0  # track if we're stuck just scrolling
 
-                # Check for blockers
-                page_text = page.inner_text("body").lower()
+            for iteration in range(max_iterations):
+                # Check for blockers via page text
+                try:
+                    page_text = page.inner_text("body").lower()
+                except Exception:
+                    page_text = ""
+
                 if "captcha" in page_text or "verify you are human" in page_text:
                     result["error"] = "CAPTCHA detected"
                     return result
                 if "sign in" in page_text[:500] or "log in" in page_text[:500]:
-                    result["error"] = "Login wall detected"
-                    return result
+                    # Only block if it looks like a login wall, not just a nav link
+                    if "sign in to" in page_text[:500] or "log in to" in page_text[:500] or "please sign in" in page_text[:1000]:
+                        result["error"] = "Login wall detected"
+                        return result
 
                 # Check for success
-                success_phrases = ["application submitted", "thank you for applying", "successfully applied"]
+                success_phrases = ["application submitted", "thank you for applying",
+                                   "successfully applied", "application received",
+                                   "application has been submitted"]
                 if any(p in page_text for p in success_phrases):
                     result["success"] = True
+                    log.info("Application submitted successfully!")
                     return result
+
+                # Take viewport screenshot (what's actually visible, crisp and readable)
+                screenshot = page.screenshot(type="png")  # viewport only, no full_page
+                b64_image = base64.b64encode(screenshot).decode()
+                log.info(f"Step {iteration + 1}: viewport screenshot taken")
 
                 # Ask Claude Vision what to do
                 actions = self._analyze_page(b64_image, job, iteration)
@@ -58,13 +76,28 @@ class VisionApplicator:
                     result["error"] = "Vision could not determine actions"
                     return result
 
+                # Track if this iteration only scrolled (no real form interaction)
+                did_real_action = False
+
                 # Execute actions
                 for action in actions:
+                    act = action.get("action", "")
                     executed = self._execute_action(page, action, resume_path, job, result)
-                    if executed:
+                    if executed and act != "scroll":
+                        did_real_action = True
                         result["fields"] += 1
 
-                page.wait_for_timeout(2000)
+                if did_real_action:
+                    consecutive_scroll_only = 0
+                else:
+                    consecutive_scroll_only += 1
+
+                # If we've scrolled 5 times without doing anything useful, we're stuck
+                if consecutive_scroll_only >= 5:
+                    result["error"] = "Stuck scrolling — no actionable form fields found"
+                    return result
+
+                page.wait_for_timeout(1500)
                 result["pages"] += 1
 
             result["error"] = "Max iterations reached"
@@ -74,24 +107,8 @@ class VisionApplicator:
             result["error"] = str(e)[:200]
             return result
 
-    def _take_screenshot(self, page: Page) -> str:
-        """Take a full-page screenshot, resizing if it exceeds Claude's 8000px limit."""
-        raw = page.screenshot(type="png", full_page=True)
-        img = Image.open(io.BytesIO(raw))
-        w, h = img.size
-
-        if w > MAX_SCREENSHOT_DIMENSION or h > MAX_SCREENSHOT_DIMENSION:
-            scale = min(MAX_SCREENSHOT_DIMENSION / w, MAX_SCREENSHOT_DIMENSION / h)
-            new_w, new_h = int(w * scale), int(h * scale)
-            img = img.resize((new_w, new_h), Image.LANCZOS)
-            log.info(f"Resized screenshot from {w}x{h} to {new_w}x{new_h}")
-
-        buf = io.BytesIO()
-        img.save(buf, format="PNG")
-        return base64.b64encode(buf.getvalue()).decode()
-
     def _analyze_page(self, b64_image: str, job: dict, step: int) -> list[dict]:
-        """Send screenshot to Claude Vision and get form-filling actions."""
+        """Send viewport screenshot to Claude Vision and get form-filling actions."""
         candidate_info = json.dumps({
             "name": f"{CANDIDATE['first_name']} {CANDIDATE['last_name']}",
             "email": CANDIDATE["email"],
@@ -107,37 +124,36 @@ class VisionApplicator:
             "education": f"{CANDIDATE['degree']} - {CANDIDATE['university']} ({CANDIDATE['graduation_year']})",
         }, indent=2)
 
-        prompt = f"""You are an automated job application assistant. Analyze this screenshot of a job application form (step {step + 1}).
+        prompt = f"""You are an automated job application assistant. This is a screenshot of what is CURRENTLY VISIBLE in the browser viewport (step {step + 1}).
 
 Candidate data:
 {candidate_info}
 
-Return a JSON array of actions to take on this page. Each action:
+Return a JSON array of actions. Each action:
 {{
   "selector": "CSS selector for the element",
-  "action": "fill" | "click" | "select" | "upload" | "skip",
-  "value": "value to enter (if fill/select)",
-  "description": "what this field is"
+  "action": "fill" | "click" | "select" | "upload" | "scroll" | "skip",
+  "value": "value to enter (for fill/select) or scroll direction (for scroll)",
+  "description": "what this field/action is"
 }}
 
-CRITICAL CSS SELECTOR RULES:
-- Use ONLY standard CSS selectors. NO jQuery pseudo-selectors.
-- NEVER use :contains(), :has-text(), :visible, or any non-standard pseudo-class.
-- For buttons with specific text, use: button[type="submit"], input[type="submit"], or target by ID/class/aria-label.
-  Examples: button[aria-label="Apply"], button.apply-btn, #submit-btn, button[data-testid="apply"]
-- For inputs, use: input[name="..."], input[id="..."], input[type="..."], textarea[name="..."]
-- For dropdowns, use: select[name="..."], select[id="..."]
-- If you cannot determine a precise selector, use a generic one like "button[type='submit']" or describe by index: "button >> nth=0"
+SELECTOR RULES (CRITICAL):
+- Use ONLY standard CSS selectors. NEVER use :contains(), :has-text(), :visible, or jQuery.
+- Target by id, name, class, type, aria-label, data-testid, or placeholder.
+  Good: input[name="email"], #first-name, button[type="submit"], textarea.cover-letter
+  Bad: button:contains("Apply"), input:visible
+- If unsure of exact selector, use Playwright text selectors: "button >> text=Apply Now"
 
-Rules:
-- Fill visible form fields with candidate data
-- Click "Next", "Continue", "Apply", or "Submit" buttons when form is filled
-- If the page needs to be scrolled down to see a button (e.g. "Apply Now" at the bottom), return a scroll action: {{"selector": "body", "action": "scroll", "value": "down", "description": "Scroll down to reveal Apply button"}}
-- For file upload fields, use action "upload"
-- For questions you can't answer with the data provided, use action "skip"
-- For salary fields, skip them (leave blank)
-- For cover letter, skip
-- Return ONLY the JSON array, no other text"""
+WHAT TO DO:
+- If you see form fields: fill them with candidate data and return fill actions.
+- If you see a button (Apply, Next, Continue, Submit): return a click action for it.
+- If the page shows a job description and you need to scroll down to find the Apply button or form: return {{"selector": "body", "action": "scroll", "value": "down", "description": "Scroll to find Apply button/form"}}
+- If you see "Apply Now", "Quick Apply", "Easy Apply" button: click it immediately.
+- For file upload (resume): use action "upload".
+- Skip salary fields, cover letter, and questions you cannot answer.
+
+IMPORTANT: Only act on what you can SEE in this screenshot. Do not guess about off-screen elements.
+Return ONLY the JSON array, no other text."""
 
         try:
             response = self.claude.messages.create(
@@ -153,27 +169,30 @@ Rules:
             )
             text = response.content[0].text.strip()
             text = text.replace("```json", "").replace("```", "").strip()
-            match = json.loads(text) if text.startswith("[") else []
-            return match
+            actions = json.loads(text) if text.startswith("[") else []
+            log.info(f"Vision returned {len(actions)} actions")
+            return actions
+        except json.JSONDecodeError as e:
+            log.error(f"Vision returned invalid JSON: {e}")
+            return []
         except Exception as e:
             log.error(f"Vision analysis failed: {e}")
             return []
 
     def _sanitize_selector(self, selector: str) -> str:
-        """Remove invalid jQuery pseudo-selectors that Playwright doesn't support."""
-        import re
-        # Remove :contains("..."), :has-text("..."), :visible, etc.
+        """Strip invalid jQuery pseudo-selectors that Playwright doesn't support."""
         sanitized = re.sub(r':contains\(["\']?[^)]*["\']?\)', '', selector)
         sanitized = re.sub(r':has-text\(["\']?[^)]*["\']?\)', '', sanitized)
         sanitized = re.sub(r':visible', '', sanitized)
-        sanitized = re.sub(r':first', '', sanitized)
+        sanitized = re.sub(r':first\b', '', sanitized)
         sanitized = sanitized.strip().rstrip(',')
         return sanitized if sanitized else selector
 
     def _find_element(self, page: Page, selector: str, desc: str):
-        """Try to find element with fallback strategies."""
-        # First try the given selector (sanitized)
+        """Try to find element with sanitized selector, then fallback strategies."""
         clean = self._sanitize_selector(selector)
+
+        # Try primary selector
         try:
             el = page.locator(clean).first
             if el.is_visible(timeout=2000):
@@ -181,29 +200,41 @@ Rules:
         except Exception:
             pass
 
-        # Fallback: try to find by text content in description
+        # Try Playwright text selector if it looks like one
+        if ">>" in selector:
+            try:
+                el = page.locator(selector).first
+                if el.is_visible(timeout=2000):
+                    return el
+            except Exception:
+                pass
+
+        # Fallback for buttons: try common patterns
         desc_lower = (desc or "").lower()
-        if any(kw in desc_lower for kw in ["apply", "submit", "next", "continue"]):
-            # Try common button patterns
-            for fallback in [
+        if any(kw in desc_lower for kw in ["apply", "submit", "next", "continue", "button"]):
+            fallbacks = [
                 "button[type='submit']", "input[type='submit']",
-                "button.btn-primary", "a.apply-button",
-                "button >> text=Apply", "button >> text=Submit",
-                "button >> text=Next", "button >> text=Continue",
-            ]:
+                "button.btn-primary", "a.apply-button", "a.btn-primary",
+            ]
+            # Also try text-based Playwright selectors
+            for word in ["Apply", "Apply Now", "Submit", "Next", "Continue"]:
+                fallbacks.append(f"button >> text={word}")
+                fallbacks.append(f"a >> text={word}")
+
+            for fb in fallbacks:
                 try:
-                    el = page.locator(fallback).first
-                    if el.is_visible(timeout=1000):
-                        log.info(f"Fallback selector matched: {fallback}")
+                    el = page.locator(fb).first
+                    if el.is_visible(timeout=800):
+                        log.info(f"Fallback matched: {fb}")
                         return el
                 except Exception:
                     continue
 
-        log.warning(f"Element not found with any strategy: {clean}")
+        log.warning(f"Element not found: {clean}")
         return None
 
     def _execute_action(self, page: Page, action: dict, resume_path: str, job: dict, result: dict) -> bool:
-        """Execute a single action from Claude Vision's instructions."""
+        """Execute a single action from Claude Vision."""
         try:
             selector = action.get("selector", "")
             act = action.get("action", "")
@@ -213,35 +244,38 @@ Rules:
             if act == "skip":
                 return False
 
-            # Handle scroll action
             if act == "scroll":
                 direction = (value or "down").lower()
+                scroll_amount = 700  # roughly one viewport height
                 if direction == "down":
-                    page.evaluate("window.scrollBy(0, 600)")
+                    page.evaluate(f"window.scrollBy(0, {scroll_amount})")
                 elif direction == "up":
-                    page.evaluate("window.scrollBy(0, -600)")
+                    page.evaluate(f"window.scrollBy(0, -{scroll_amount})")
                 elif direction == "bottom":
                     page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                elif direction == "top":
+                    page.evaluate("window.scrollTo(0, 0)")
                 log.info(f"Scrolled {direction}: {desc}")
                 page.wait_for_timeout(1000)
-                return True
+                return True  # scroll counts as executed but not as a "real action"
 
             element = self._find_element(page, selector, desc)
             if not element:
                 return False
 
-            # Scroll element into view before interacting
-            element.scroll_into_view_if_needed(timeout=3000)
+            # Scroll element into view
+            try:
+                element.scroll_into_view_if_needed(timeout=3000)
+            except Exception:
+                pass
 
             if act == "fill":
-                # Check if this is a question that needs notes
                 if self.notes_client and _is_open_question(desc):
                     answer = self.notes_client.answer_question(
                         desc, job.get("title", ""), job.get("company", "")
                     )
                     if answer:
                         value = answer
-
                 element.clear()
                 element.fill(value)
                 log.info(f"Filled '{desc}': {value[:50]}...")
@@ -254,7 +288,10 @@ Rules:
                 return True
 
             elif act == "select":
-                element.select_option(label=value)
+                try:
+                    element.select_option(label=value)
+                except Exception:
+                    element.select_option(value=value)
                 log.info(f"Selected '{desc}': {value}")
                 return True
 
