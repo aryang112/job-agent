@@ -1,11 +1,9 @@
-"""Hybrid DOM + Vision ATS form filling for non-Indeed applications.
+"""Hybrid DOM + AI ATS form filling for non-Indeed applications.
 
 Strategy: DOM-first, Vision-fallback.
-Phase 1: Parse DOM to find Apply button and click it (zero API calls).
-Phase 2: Parse DOM to identify form fields and fill them with candidate data.
+Phase 1: Scrape ALL clickable elements from DOM, ask Claude to pick the right button (1 cheap text call).
+Phase 2: Parse DOM to identify form fields and fill them with candidate data (0 API calls).
 Phase 3: Only use Claude Vision for fields the DOM parser can't figure out.
-
-This avoids scrolling 8-9 times with Vision just to find a button.
 """
 import base64
 import json
@@ -14,29 +12,6 @@ import anthropic
 from playwright.sync_api import Page, Locator
 from field_mapper import CANDIDATE, get_field_value
 from logger import log
-
-
-# Common Apply button selectors ordered by likelihood
-APPLY_BUTTON_SELECTORS = [
-    "a >> text=Apply Now",
-    "button >> text=Apply Now",
-    "a >> text=Apply",
-    "button >> text=Apply",
-    "a >> text=Quick Apply",
-    "button >> text=Quick Apply",
-    "a >> text=Easy Apply",
-    "button >> text=Easy Apply",
-    "a >> text=Apply for this job",
-    "button >> text=Apply for this job",
-    "a >> text=Submit Application",
-    "button >> text=Submit Application",
-    "a[class*='apply']",
-    "button[class*='apply']",
-    "a[data-testid*='apply']",
-    "button[data-testid*='apply']",
-    "a[id*='apply']",
-    "button[id*='apply']",
-]
 
 # Map common form label patterns to candidate data
 FIELD_MAP = {
@@ -158,39 +133,171 @@ class VisionApplicator:
             result["error"] = str(e)[:200]
             return result
 
-    # ---- Phase 1: Apply Button Discovery ----
+    # ---- Phase 1: Smart Button Discovery ----
+
+    def _scrape_clickables(self, page: Page) -> list[dict]:
+        """Extract all visible clickable elements (buttons, links) from the DOM."""
+        clickables = []
+        try:
+            items = page.evaluate("""() => {
+                const results = [];
+                const elements = document.querySelectorAll('a, button, input[type="submit"], input[type="button"], [role="button"], [onclick]');
+                for (const el of elements) {
+                    // Skip invisible
+                    const rect = el.getBoundingClientRect();
+                    if (rect.width === 0 || rect.height === 0) continue;
+                    const style = window.getComputedStyle(el);
+                    if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') continue;
+
+                    const text = (el.innerText || el.value || '').trim().substring(0, 80);
+                    if (!text) continue;
+
+                    // Build a unique selector
+                    let selector = '';
+                    if (el.id) {
+                        selector = '#' + el.id;
+                    } else if (el.name) {
+                        selector = el.tagName.toLowerCase() + '[name="' + el.name + '"]';
+                    } else if (el.className && typeof el.className === 'string') {
+                        const cls = el.className.trim().split(/\\s+/).slice(0, 3).join('.');
+                        if (cls) selector = el.tagName.toLowerCase() + '.' + cls;
+                    }
+                    if (!selector) {
+                        selector = el.tagName.toLowerCase();
+                    }
+
+                    results.push({
+                        index: results.length,
+                        tag: el.tagName.toLowerCase(),
+                        text: text,
+                        href: el.href || '',
+                        selector: selector,
+                        ariaLabel: el.getAttribute('aria-label') || '',
+                        classes: el.className || '',
+                    });
+                }
+                return results.slice(0, 50);  // Cap at 50 to keep prompt small
+            }""")
+            clickables = items or []
+        except Exception as e:
+            log.warning(f"Error scraping clickables: {e}")
+        return clickables
+
+    def _ask_claude_pick_button(self, clickables: list[dict], purpose: str) -> dict | None:
+        """Ask Claude (text-only, no vision) to pick the right button from a list."""
+        if not clickables:
+            return None
+
+        # Format the list for Claude
+        choices = []
+        for c in clickables:
+            line = f"[{c['index']}] <{c['tag']}> \"{c['text']}\""
+            if c.get('href'):
+                line += f"  href={c['href'][:80]}"
+            if c.get('ariaLabel'):
+                line += f"  aria-label=\"{c['ariaLabel']}\""
+            choices.append(line)
+        choices_text = "\n".join(choices)
+
+        prompt = f"""Here are all the clickable elements on a job posting page:
+
+{choices_text}
+
+I want to: {purpose}
+
+Which element should I click? Return ONLY a JSON object:
+{{"index": <number>, "reason": "<brief reason>"}}
+
+If none of these elements match, return: {{"index": -1, "reason": "no matching element found"}}"""
+
+        try:
+            response = self.claude.messages.create(
+                model="claude-haiku-4-5-20251001",  # Fast + cheap for text-only
+                max_tokens=200,
+                messages=[{"role": "user", "content": prompt}]
+            )
+            text = response.content[0].text.strip()
+            text = text.replace("```json", "").replace("```", "").strip()
+            result = json.loads(text)
+            idx = result.get("index", -1)
+            reason = result.get("reason", "")
+            if idx >= 0 and idx < len(clickables):
+                log.info(f"Claude picked button [{idx}]: \"{clickables[idx]['text']}\" — {reason}")
+                return clickables[idx]
+            else:
+                log.warning(f"Claude found no matching button: {reason}")
+                return None
+        except Exception as e:
+            log.error(f"Claude button picker failed: {e}")
+            return None
 
     def _click_apply_button(self, page: Page) -> bool:
-        """Find and click the Apply button using DOM selectors."""
-        for selector in APPLY_BUTTON_SELECTORS:
+        """Scrape all clickable elements, ask Claude which one is the Apply button, click it."""
+        clickables = self._scrape_clickables(page)
+        log.info(f"Found {len(clickables)} clickable elements on page")
+
+        if not clickables:
+            log.warning("No clickable elements found")
+            return False
+
+        picked = self._ask_claude_pick_button(
+            clickables,
+            "Click the button/link that starts the job application process (e.g. 'Apply Now', 'Apply', 'Quick Apply', 'Submit Resume', 'Start Application', or similar). NOT 'Save Job', 'Share', 'Sign In', 'Report', or navigation links."
+        )
+
+        if not picked:
+            return False
+
+        # Click using the selector, with fallback to text matching
+        return self._click_picked_element(page, picked)
+
+    def _click_picked_element(self, page: Page, picked: dict) -> bool:
+        """Click the element Claude picked, trying multiple strategies."""
+        selector = picked.get("selector", "")
+        text = picked.get("text", "")
+        tag = picked.get("tag", "")
+
+        # Strategy 1: Direct selector
+        if selector:
             try:
                 el = page.locator(selector).first
-                if el.is_visible(timeout=500):
+                if el.is_visible(timeout=1000):
                     el.scroll_into_view_if_needed()
                     el.click()
-                    log.info(f"Clicked Apply button: {selector}")
+                    log.info(f"Clicked via selector: {selector}")
                     return True
             except Exception:
-                continue
+                pass
 
-        # Last resort: search all links/buttons for "apply" text
-        for tag in ["a", "button"]:
+        # Strategy 2: Playwright text selector
+        if text:
+            try:
+                el = page.locator(f"{tag} >> text={text}").first
+                if el.is_visible(timeout=1000):
+                    el.scroll_into_view_if_needed()
+                    el.click()
+                    log.info(f"Clicked via text: '{text}'")
+                    return True
+            except Exception:
+                pass
+
+            # Strategy 3: Exact text match across all same-tag elements
             try:
                 elements = page.locator(tag).all()
                 for el in elements:
                     try:
-                        text = el.inner_text(timeout=500).lower().strip()
-                        if "apply" in text and len(text) < 30:
+                        el_text = el.inner_text(timeout=300).strip()
+                        if el_text == text:
                             el.scroll_into_view_if_needed()
                             el.click()
-                            log.info(f"Clicked Apply via text scan: '{text}'")
+                            log.info(f"Clicked via exact text match: '{text}'")
                             return True
                     except Exception:
                         continue
             except Exception:
-                continue
+                pass
 
-        log.warning("No Apply button found via DOM")
+        log.warning(f"Could not click picked element: {selector} / '{text}'")
         return False
 
     def _is_on_form(self, page: Page) -> bool:
@@ -467,43 +574,32 @@ Rules:
     # ---- Navigation ----
 
     def _click_next_or_submit(self, page: Page) -> bool:
-        """Find and click Submit/Next/Continue button."""
-        selectors = [
-            "button[type='submit']", "input[type='submit']",
-            "button >> text=Submit", "button >> text=Next",
-            "button >> text=Continue", "button >> text=Save",
-            "button >> text=Submit Application",
-            "a >> text=Submit", "a >> text=Next", "a >> text=Continue",
-            "button.btn-primary", "button.submit-btn",
-        ]
-        for sel in selectors:
-            try:
-                el = page.locator(sel).first
-                if el.is_visible(timeout=500):
-                    el.scroll_into_view_if_needed()
-                    el.click()
-                    log.info(f"Clicked next/submit: {sel}")
-                    return True
-            except Exception:
-                continue
-
-        # Fallback: scan all buttons
+        """Scrape clickable elements and ask Claude which is the Next/Submit button."""
+        # Quick check: try obvious submit button first (free, no API call)
         try:
-            buttons = page.locator("button, input[type='submit']").all()
-            for btn in buttons:
-                try:
-                    text = btn.inner_text(timeout=300).lower().strip()
-                    if any(kw in text for kw in ["submit", "next", "continue", "apply", "save"]):
-                        btn.scroll_into_view_if_needed()
-                        btn.click()
-                        log.info(f"Clicked via text scan: '{text}'")
-                        return True
-                except Exception:
-                    continue
+            submit = page.locator("button[type='submit'], input[type='submit']").first
+            if submit.is_visible(timeout=500):
+                submit.scroll_into_view_if_needed()
+                submit.click()
+                log.info("Clicked submit button (type=submit)")
+                return True
         except Exception:
             pass
 
-        return False
+        # Smart approach: scrape + ask Claude
+        clickables = self._scrape_clickables(page)
+        if not clickables:
+            return False
+
+        picked = self._ask_claude_pick_button(
+            clickables,
+            "Click the button that submits the form or goes to the next step (e.g. 'Submit', 'Submit Application', 'Next', 'Continue', 'Save and Continue', 'Review', 'Send Application'). NOT 'Cancel', 'Back', 'Save Draft', 'Sign In', or navigation links."
+        )
+
+        if not picked:
+            return False
+
+        return self._click_picked_element(page, picked)
 
     def _check_blockers(self, page: Page) -> str | None:
         """Check for blockers or success. Returns 'success', error string, or None."""
