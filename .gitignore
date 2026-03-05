@@ -4,6 +4,7 @@ node_modules/
 .env
 *.log
 windows-agent/config.json
+windows-agent/browser_profile/
 windows-agent/__pycache__/
 __pycache__/
 *.pyc

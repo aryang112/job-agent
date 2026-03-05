@@ -4,12 +4,16 @@ import time
 import sys
 import os
 from playwright.sync_api import sync_playwright
+from playwright_stealth import stealth_sync
 
 from supabase_client import SupabaseOps
 from applicator import Applicator
 from notes_client import NotesClient
 from throttle import Throttle
 from logger import log, log_application
+
+# Persistent browser profile directory (keeps cookies/localStorage between runs)
+PROFILE_DIR = os.path.join(os.path.dirname(__file__), "browser_profile")
 
 
 def load_config() -> dict:
@@ -42,12 +46,21 @@ def main():
     log.info(f"Poll interval: {poll_interval}s, Max daily: {throttle.max_daily}")
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=False)  # Visible for debugging
-        context = browser.new_context(
+        # Persistent context: cookies/localStorage survive between runs
+        # Cloudflare remembers "verified" browsers, reducing challenges
+        os.makedirs(PROFILE_DIR, exist_ok=True)
+        context = p.chromium.launch_persistent_context(
+            user_data_dir=PROFILE_DIR,
+            headless=False,
             viewport={"width": 1280, "height": 900},
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+            args=[
+                "--disable-blink-features=AutomationControlled",  # Hide automation flag
+            ],
         )
-        page = context.new_page()
+        page = context.pages[0] if context.pages else context.new_page()
+        # Apply stealth patches (hides navigator.webdriver, chrome.runtime, etc.)
+        stealth_sync(page)
 
         while True:
             try:
@@ -123,7 +136,7 @@ def main():
                 log.error(f"Unexpected error: {e}")
                 time.sleep(60)
 
-        browser.close()
+        context.close()
 
 
 if __name__ == "__main__":

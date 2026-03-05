@@ -75,6 +75,15 @@ class VisionApplicator:
             page.wait_for_timeout(3000)
             result["pages"] += 1
 
+            # --- Phase 0: Check for Cloudflare on initial load ---
+            blocker = self._check_blockers(page)
+            if blocker == "success":
+                result["success"] = True
+                return result
+            if blocker:
+                result["error"] = blocker
+                return result
+
             # --- Phase 1: Find and click Apply button via DOM ---
             if not self._is_on_form(page):
                 clicked = self._click_apply_button(page)
@@ -601,6 +610,33 @@ Rules:
 
         return self._click_picked_element(page, picked)
 
+    def _wait_for_cloudflare(self, page: Page) -> bool:
+        """Wait for Cloudflare Turnstile/challenge to auto-resolve. Returns True if cleared."""
+        log.info("Cloudflare challenge detected — waiting for auto-resolve...")
+        for i in range(20):  # Wait up to ~20 seconds
+            page.wait_for_timeout(1000)
+            try:
+                # Check if the challenge checkbox is there and click it
+                cf_checkbox = page.locator("input[type='checkbox']").first
+                if cf_checkbox.is_visible(timeout=500):
+                    try:
+                        cf_checkbox.click()
+                        log.info("Clicked Cloudflare checkbox")
+                        page.wait_for_timeout(3000)
+                    except Exception:
+                        pass
+
+                # Check if Turnstile iframe resolved (page content changed)
+                page_text = page.inner_text("body").lower()
+                if "verify you are human" not in page_text and "checking" not in page_text[:200]:
+                    log.info(f"Cloudflare cleared after {i + 1}s")
+                    return True
+            except Exception:
+                pass
+
+        log.warning("Cloudflare challenge did not auto-resolve")
+        return False
+
     def _check_blockers(self, page: Page) -> str | None:
         """Check for blockers or success. Returns 'success', error string, or None."""
         try:
@@ -615,9 +651,18 @@ Rules:
         if any(p in page_text for p in success_phrases):
             return "success"
 
-        # Blockers
-        if "captcha" in page_text or "verify you are human" in page_text:
+        # Cloudflare Turnstile — wait for auto-resolve instead of immediately failing
+        cloudflare_phrases = ["verify you are human", "checking your browser",
+                              "just a moment", "cloudflare"]
+        if any(p in page_text for p in cloudflare_phrases):
+            if self._wait_for_cloudflare(page):
+                return None  # Cleared — continue normally
+            return "Cloudflare challenge (not auto-resolved)"
+
+        # Other CAPTCHAs (reCAPTCHA etc.) — can't solve these
+        if "captcha" in page_text:
             return "CAPTCHA detected"
+
         if "please sign in" in page_text[:1000] or "sign in to apply" in page_text[:1000]:
             return "Login wall detected"
         if "this job is no longer available" in page_text or "position has been filled" in page_text:
