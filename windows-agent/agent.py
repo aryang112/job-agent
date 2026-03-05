@@ -4,7 +4,7 @@ import time
 import sys
 import os
 from playwright.sync_api import sync_playwright
-from playwright_stealth import Stealth
+from undetected_playwright import stealth_sync
 
 from supabase_client import SupabaseOps
 from applicator import Applicator
@@ -12,10 +12,9 @@ from notes_client import NotesClient
 from throttle import Throttle
 from logger import log, log_application
 
-# Use real Chrome (not Playwright's bundled Chromium) — much less likely to be flagged
+# Use real Chrome (not Playwright's bundled Chromium)
 CHROME_PATH = r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe"
 if not os.path.exists(CHROME_PATH):
-    # Try other common paths
     for p in [
         r"C:\Program Files\Google\Chrome\Application\chrome.exe",
         r"C:\Users\{}\AppData\Local\Google\Chrome\Application\chrome.exe".format(os.getenv("USERNAME", "")),
@@ -24,13 +23,10 @@ if not os.path.exists(CHROME_PATH):
             CHROME_PATH = p
             break
 
-# Persistent browser profile (keeps cookies, Cloudflare clearance, etc.)
+# Persistent browser profile
 PROFILE_DIR = os.path.join(os.path.dirname(__file__), "chrome_profile")
 
-# Stealth instance
-STEALTH = Stealth()
-
-# Errors that mean "don't retry, skip straight to manual_required"
+# Errors that skip retries → manual_required immediately
 SKIP_ERRORS = [
     "Cloudflare challenge",
     "CAPTCHA detected",
@@ -39,13 +35,13 @@ SKIP_ERRORS = [
     "Blocked site",
 ]
 
-# Sites that consistently block automation — skip immediately
+# Sites that consistently block automation
 BLOCKED_DOMAINS = [
-    "linkedin.com",        # Requires login + aggressive bot detection
-    "dice.com",            # Heavy Cloudflare
-    "ziprecruiter.com",    # Requires login
-    "monster.com",         # Heavy Cloudflare
-    "careerbuilder.com",   # Heavy Cloudflare
+    "linkedin.com",
+    "dice.com",
+    "ziprecruiter.com",
+    "monster.com",
+    "careerbuilder.com",
 ]
 
 
@@ -65,18 +61,15 @@ def is_skip_error(error: str) -> bool:
 
 
 def is_blocked_site(url: str) -> bool:
-    """Check if URL is on the blocklist of sites that always block automation."""
     if not url:
         return False
-    url_lower = url.lower()
-    return any(domain in url_lower for domain in BLOCKED_DOMAINS)
+    return any(domain in url.lower() for domain in BLOCKED_DOMAINS)
 
 
 def main():
     config = load_config()
     log.info("Job Agent starting...")
 
-    # Initialize clients
     db = SupabaseOps(config["supabase_url"], config["supabase_service_key"])
     notes = NotesClient(db, config["anthropic_api_key"])
     capsolver_key = config.get("capsolver_api_key", "")
@@ -92,15 +85,13 @@ def main():
 
     log.info(f"Resume: {resume_path}")
     log.info(f"Chrome: {CHROME_PATH}")
-    log.info(f"Profile: {PROFILE_DIR}")
     log.info(f"Poll interval: {poll_interval}s, Max daily: {throttle.max_daily}")
     log.info(f"CapSolver: {'enabled' if capsolver_key else 'disabled'}")
 
     with sync_playwright() as p:
         os.makedirs(PROFILE_DIR, exist_ok=True)
 
-        # Launch REAL Chrome (not Chromium) with persistent profile
-        # Real Chrome has a legit browser fingerprint that Cloudflare trusts
+        # Launch real Chrome with persistent profile
         context = p.chromium.launch_persistent_context(
             user_data_dir=PROFILE_DIR,
             executable_path=CHROME_PATH,
@@ -108,8 +99,8 @@ def main():
             viewport={"width": 1280, "height": 900},
             args=[
                 "--disable-blink-features=AutomationControlled",
-                "--no-sandbox",              # Required for persistent profile on Windows
-                "--disable-gpu-sandbox",     # Prevents GPU sandbox errors
+                "--no-sandbox",
+                "--disable-gpu-sandbox",
                 "--no-first-run",
                 "--no-default-browser-check",
                 "--disable-infobars",
@@ -118,14 +109,10 @@ def main():
             ignore_default_args=["--enable-automation"],
         )
 
-        # Apply stealth to context — patches all current and future pages
-        STEALTH.apply_stealth_sync(context)
-
-        # Also patch any new tabs that open
-        def on_new_page(new_page):
-            STEALTH.apply_stealth_sync(new_page)
-            log.info("Stealth applied to new tab")
-        context.on("page", on_new_page)
+        # undetected-playwright: patches CDP to remove automation signals
+        # This is what removes the "controlled by automated test software" banner
+        stealth_sync(context)
+        log.info("Stealth applied via undetected-playwright")
 
         page = context.pages[0] if context.pages else context.new_page()
 
@@ -150,12 +137,10 @@ def main():
                     if not throttle.can_apply():
                         break
 
-                    # Skip if interviewing at this company
                     if job.get("company", "").lower() in interviewing:
                         log.info(f"Skipping {job['company']} — active interview")
                         continue
 
-                    # Skip blocked sites immediately
                     job_url = job.get("url", "")
                     if is_blocked_site(job_url):
                         log.warning(f"Blocked site — skipping: {job_url}")
@@ -165,7 +150,6 @@ def main():
                         )
                         continue
 
-                    # Attempt application
                     success = False
                     for attempt in range(retry_config["max_attempts"]):
                         result = applicator.apply_to_job(page, job, resume_path)
