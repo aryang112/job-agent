@@ -108,6 +108,8 @@ def main():
             viewport={"width": 1280, "height": 900},
             args=[
                 "--disable-blink-features=AutomationControlled",
+                "--no-sandbox",              # Required for persistent profile on Windows
+                "--disable-gpu-sandbox",     # Prevents GPU sandbox errors
                 "--no-first-run",
                 "--no-default-browser-check",
                 "--disable-infobars",
