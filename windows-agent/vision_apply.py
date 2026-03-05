@@ -613,28 +613,68 @@ Rules:
     def _wait_for_cloudflare(self, page: Page) -> bool:
         """Wait for Cloudflare Turnstile/challenge to auto-resolve. Returns True if cleared."""
         log.info("Cloudflare challenge detected — waiting for auto-resolve...")
-        for i in range(20):  # Wait up to ~20 seconds
+
+        # First, try to click the Turnstile checkbox (it's inside an iframe)
+        clicked_checkbox = False
+        for i in range(25):  # Wait up to ~25 seconds
             page.wait_for_timeout(1000)
             try:
-                # Check if the challenge checkbox is there and click it
-                cf_checkbox = page.locator("input[type='checkbox']").first
-                if cf_checkbox.is_visible(timeout=500):
-                    try:
-                        cf_checkbox.click()
-                        log.info("Clicked Cloudflare checkbox")
-                        page.wait_for_timeout(3000)
-                    except Exception:
-                        pass
+                # Turnstile checkbox lives inside an iframe — search all frames
+                if not clicked_checkbox:
+                    for frame in page.frames:
+                        try:
+                            # Turnstile iframe URL contains "challenges.cloudflare.com"
+                            if "cloudflare" in (frame.url or "").lower() or "turnstile" in (frame.url or "").lower():
+                                checkbox = frame.locator("input[type='checkbox'], .cb-lb, #challenge-stage").first
+                                if checkbox.is_visible(timeout=500):
+                                    checkbox.click()
+                                    clicked_checkbox = True
+                                    log.info("Clicked Cloudflare Turnstile checkbox in iframe")
+                                    page.wait_for_timeout(3000)
+                                    break
+                        except Exception:
+                            continue
 
-                # Check if Turnstile iframe resolved (page content changed)
+                    # Also try clicking the Turnstile widget div on the main page
+                    # (sometimes it's a clickable div wrapping the iframe)
+                    if not clicked_checkbox:
+                        for selector in [
+                            "iframe[src*='cloudflare']",
+                            "iframe[src*='turnstile']",
+                            "[class*='turnstile']",
+                            "[id*='turnstile']",
+                            "[class*='cf-turnstile']",
+                            "#cf-turnstile",
+                        ]:
+                            try:
+                                el = page.locator(selector).first
+                                if el.is_visible(timeout=300):
+                                    # Click the center of the iframe/widget
+                                    box = el.bounding_box()
+                                    if box:
+                                        page.mouse.click(box["x"] + box["width"] / 2, box["y"] + box["height"] / 2)
+                                        clicked_checkbox = True
+                                        log.info(f"Clicked Turnstile widget via: {selector}")
+                                        page.wait_for_timeout(3000)
+                                        break
+                            except Exception:
+                                continue
+
+                # Check if challenge cleared
                 page_text = page.inner_text("body").lower()
-                if "verify you are human" not in page_text and "checking" not in page_text[:200]:
+                challenge_gone = (
+                    "verify you are human" not in page_text
+                    and "checking your browser" not in page_text
+                    and "just a moment" not in page_text
+                )
+                if challenge_gone:
                     log.info(f"Cloudflare cleared after {i + 1}s")
                     return True
+
             except Exception:
                 pass
 
-        log.warning("Cloudflare challenge did not auto-resolve")
+        log.warning("Cloudflare challenge did not auto-resolve after 25s")
         return False
 
     def _check_blockers(self, page: Page) -> str | None:
