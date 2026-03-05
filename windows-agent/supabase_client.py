@@ -7,14 +7,20 @@ class SupabaseOps:
         self.client = create_client(url, key)
 
     def get_queued_jobs(self, limit: int = 10):
-        """Fetch jobs with status=queued_to_apply, ordered by score DESC."""
+        """Fetch jobs with status=queued_to_apply, easy_apply first then by score DESC."""
         result = self.client.table("jobs") \
             .select("*") \
             .eq("status", "queued_to_apply") \
             .order("score", desc=True) \
-            .limit(limit) \
+            .limit(limit * 2) \
             .execute()
-        return result.data or []
+        jobs = result.data or []
+        # Sort: easy_apply first, then by score descending
+        jobs.sort(key=lambda j: (
+            0 if j.get("ats_type") == "easy_apply" else 1,
+            -(j.get("score") or 0),
+        ))
+        return jobs[:limit]
 
     def get_interviewing_companies(self):
         """Get companies where we're currently interviewing."""

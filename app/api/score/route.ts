@@ -95,14 +95,27 @@ Description: ${(job.description || "").slice(0, 3000)}
       score = Math.min(score + 10, 100);
     }
 
+    // Easy Apply boost — these are automatable, prioritize them
+    const isEasyApply = (job.ats_type === "easy_apply");
+    if (isEasyApply && score >= 50) {
+      score = Math.min(score + 10, 100);
+    }
+
     // Auto-status assignment
     let status = score < 60 ? "rejected" : "new";
     let queuedAt: string | null = null;
 
-    if (score >= 85) {
+    // Blocked ATS sites go straight to manual
+    if (job.ats_type === "blocked") {
+      status = score >= 60 ? "manual_required" : "rejected";
+    } else if (score >= 85) {
       status = "queued_to_apply";
       queuedAt = new Date().toISOString();
     } else if (score >= 75 && federal) {
+      status = "queued_to_apply";
+      queuedAt = new Date().toISOString();
+    } else if (score >= 70 && isEasyApply) {
+      // Lower threshold for Easy Apply since bot can handle them
       status = "queued_to_apply";
       queuedAt = new Date().toISOString();
     }

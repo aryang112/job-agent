@@ -43,6 +43,8 @@ async function searchJobs(query: string): Promise<any[]> {
       url: r.job_apply_link || r.job_google_link || null,
       description: (r.job_description || "").slice(0, 5000),
       search_query: query,
+      is_direct_apply: r.job_apply_is_direct === true,  // Indeed Easy Apply
+      publisher: r.job_publisher || "",                   // "Indeed", "LinkedIn", etc.
     }));
   } catch (err: any) {
     console.error(`[scan] JSearch failed for "${query}":`, err?.message || err);
@@ -103,16 +105,29 @@ function hasClearanceKeywords(description: string): boolean {
   return CLEARANCE_KEYWORDS.some(kw => lower.includes(kw));
 }
 
-// Detect ATS type from URL
-function detectAtsType(url: string): string {
+// Detect ATS type from URL and JSearch metadata
+function detectAtsType(url: string, isDirectApply: boolean, publisher: string): string {
   if (!url) return "unknown";
   const u = url.toLowerCase();
+  const pub = (publisher || "").toLowerCase();
+
+  // Indeed Easy Apply: either JSearch says direct apply or URL is indeed.com
+  if (isDirectApply && pub.includes("indeed")) return "easy_apply";
   if (u.includes("indeed.com/applystart") || u.includes("indeed.com/viewjob")) return "easy_apply";
+  if (isDirectApply) return "easy_apply";  // Other direct apply platforms
+
+  // External ATS platforms
   if (u.includes("myworkdayjobs.com") || u.includes("workday.com")) return "workday";
   if (u.includes("boards.greenhouse.io") || u.includes("greenhouse.io")) return "greenhouse";
   if (u.includes("lever.co") || u.includes("jobs.lever.co")) return "lever";
   if (u.includes("icims.com")) return "icims";
   if (u.includes("taleo.net")) return "taleo";
+
+  // Blocked sites — mark so agent skips them
+  if (u.includes("linkedin.com")) return "blocked";
+  if (u.includes("dice.com")) return "blocked";
+  if (u.includes("ziprecruiter.com")) return "blocked";
+
   return "unknown";
 }
 
@@ -174,7 +189,7 @@ export async function GET(req: NextRequest) {
     const defensePrime = isDefensePrime(company);
     const federal = defensePrime || hasClearanceKeywords(description);
     const clearanceMentioned = hasClearanceKeywords(description);
-    const atsType = detectAtsType(job.url || "");
+    const atsType = detectAtsType(job.url || "", job.is_direct_apply || false, job.publisher || "");
 
     await supabaseAdmin.from("jobs").upsert({
       id: job.job_id,
