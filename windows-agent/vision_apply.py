@@ -1,18 +1,84 @@
-"""Claude Vision-based ATS form filling for non-Indeed applications.
+"""Hybrid DOM + Vision ATS form filling for non-Indeed applications.
 
-Strategy: viewport-based navigation.
-- Always screenshot what's currently visible (1280x~800), never full-page.
-- Claude sees crisp, readable content and decides: fill fields, click buttons, or scroll.
-- Each iteration is one viewport screenshot → actions → next screenshot.
+Strategy: DOM-first, Vision-fallback.
+Phase 1: Parse DOM to find Apply button and click it (zero API calls).
+Phase 2: Parse DOM to identify form fields and fill them with candidate data.
+Phase 3: Only use Claude Vision for fields the DOM parser can't figure out.
+
+This avoids scrolling 8-9 times with Vision just to find a button.
 """
 import base64
-import io
 import json
 import re
 import anthropic
-from playwright.sync_api import Page
+from playwright.sync_api import Page, Locator
 from field_mapper import CANDIDATE, get_field_value
 from logger import log
+
+
+# Common Apply button selectors ordered by likelihood
+APPLY_BUTTON_SELECTORS = [
+    "a >> text=Apply Now",
+    "button >> text=Apply Now",
+    "a >> text=Apply",
+    "button >> text=Apply",
+    "a >> text=Quick Apply",
+    "button >> text=Quick Apply",
+    "a >> text=Easy Apply",
+    "button >> text=Easy Apply",
+    "a >> text=Apply for this job",
+    "button >> text=Apply for this job",
+    "a >> text=Submit Application",
+    "button >> text=Submit Application",
+    "a[class*='apply']",
+    "button[class*='apply']",
+    "a[data-testid*='apply']",
+    "button[data-testid*='apply']",
+    "a[id*='apply']",
+    "button[id*='apply']",
+]
+
+# Map common form label patterns to candidate data
+FIELD_MAP = {
+    # Name fields
+    r"first.?name": CANDIDATE.get("first_name", ""),
+    r"last.?name": CANDIDATE.get("last_name", ""),
+    r"full.?name": f"{CANDIDATE.get('first_name', '')} {CANDIDATE.get('last_name', '')}",
+    # Contact
+    r"email": CANDIDATE.get("email", ""),
+    r"phone|mobile|telephone": CANDIDATE.get("phone", ""),
+    # Location
+    r"city": CANDIDATE.get("city", ""),
+    r"state|province": CANDIDATE.get("state", ""),
+    r"zip|postal": CANDIDATE.get("zip", ""),
+    r"address|street": CANDIDATE.get("address", ""),
+    r"country": "United States",
+    # Professional
+    r"current.?title|job.?title|position": CANDIDATE.get("current_title", ""),
+    r"company|employer|current.?company|organization": "GDIT",
+    r"years?.?(of)?.?experience|experience.?years": str(CANDIDATE.get("years_experience", "")),
+    r"linkedin": CANDIDATE.get("linkedin", ""),
+    r"website|portfolio|url": CANDIDATE.get("website", ""),
+    # Work authorization
+    r"authorized|work.?auth|eligible|legally": "Yes",
+    r"sponsor|visa": "No",
+    r"clearance|security": CANDIDATE.get("clearance", ""),
+    # Education
+    r"school|university|college|institution": CANDIDATE.get("university", ""),
+    r"degree": CANDIDATE.get("degree", ""),
+    r"graduation|grad.?year": CANDIDATE.get("graduation_year", ""),
+    r"gpa": "",
+    r"major|field.?of.?study": CANDIDATE.get("major", ""),
+}
+
+# Fields to skip
+SKIP_PATTERNS = [
+    r"salary|compensation|pay|desired.?rate|expected.?salary",
+    r"cover.?letter",
+    r"hear.?about|how.?did.?you|referral|source",
+    r"gender|race|ethnicity|veteran|disability|demographic",
+    r"start.?date|available|availability",
+]
 
 
 class VisionApplicator:
@@ -21,10 +87,6 @@ class VisionApplicator:
         self.notes_client = notes_client
 
     def apply(self, page: Page, job: dict, resume_path: str) -> dict:
-        """
-        Use Claude Vision to navigate and fill ATS forms.
-        Returns: { success: bool, pages: int, fields: int, resume_uploaded: bool, error: str|None }
-        """
         result = {"success": False, "pages": 0, "fields": 0, "resume_uploaded": False, "error": None}
 
         try:
@@ -33,82 +95,267 @@ class VisionApplicator:
                 result["error"] = "No job URL"
                 return result
 
+            log.info(f"Navigating to: {url}")
             page.goto(url, wait_until="domcontentloaded", timeout=30000)
-            page.wait_for_timeout(2000)
+            page.wait_for_timeout(3000)
             result["pages"] += 1
 
-            max_iterations = 20
-            consecutive_scroll_only = 0  # track if we're stuck just scrolling
-
-            for iteration in range(max_iterations):
-                # Check for blockers via page text
-                try:
-                    page_text = page.inner_text("body").lower()
-                except Exception:
-                    page_text = ""
-
-                if "captcha" in page_text or "verify you are human" in page_text:
-                    result["error"] = "CAPTCHA detected"
+            # --- Phase 1: Find and click Apply button via DOM ---
+            if not self._is_on_form(page):
+                clicked = self._click_apply_button(page)
+                if not clicked:
+                    result["error"] = "Could not find Apply button via DOM"
                     return result
-                if "sign in" in page_text[:500] or "log in" in page_text[:500]:
-                    # Only block if it looks like a login wall, not just a nav link
-                    if "sign in to" in page_text[:500] or "log in to" in page_text[:500] or "please sign in" in page_text[:1000]:
-                        result["error"] = "Login wall detected"
-                        return result
+                page.wait_for_timeout(3000)
+                result["pages"] += 1
 
-                # Check for success
-                success_phrases = ["application submitted", "thank you for applying",
-                                   "successfully applied", "application received",
-                                   "application has been submitted"]
-                if any(p in page_text for p in success_phrases):
+            # --- Phase 2+3: Fill form (DOM-first, Vision-fallback) ---
+            max_pages = 10
+            for page_num in range(max_pages):
+                # Check blockers
+                blocker = self._check_blockers(page)
+                if blocker == "success":
                     result["success"] = True
                     log.info("Application submitted successfully!")
                     return result
-
-                # Take viewport screenshot (what's actually visible, crisp and readable)
-                screenshot = page.screenshot(type="png")  # viewport only, no full_page
-                b64_image = base64.b64encode(screenshot).decode()
-                log.info(f"Step {iteration + 1}: viewport screenshot taken")
-
-                # Ask Claude Vision what to do
-                actions = self._analyze_page(b64_image, job, iteration)
-                if not actions:
-                    result["error"] = "Vision could not determine actions"
+                if blocker:
+                    result["error"] = blocker
                     return result
 
-                # Track if this iteration only scrolled (no real form interaction)
-                did_real_action = False
+                # Try DOM-based form filling first
+                dom_filled = self._fill_form_via_dom(page, resume_path, result)
+                log.info(f"DOM filled {dom_filled} fields on page {page_num + 1}")
 
-                # Execute actions
-                for action in actions:
-                    act = action.get("action", "")
-                    executed = self._execute_action(page, action, resume_path, job, result)
-                    if executed and act != "scroll":
-                        did_real_action = True
-                        result["fields"] += 1
+                # Check for unfilled required fields or complex fields — use Vision
+                unfilled = self._get_unfilled_fields(page)
+                if unfilled:
+                    log.info(f"Found {len(unfilled)} unfilled fields, using Vision")
+                    vision_filled = self._fill_with_vision(page, job, resume_path, result, unfilled)
+                    log.info(f"Vision filled {vision_filled} additional fields")
 
-                if did_real_action:
-                    consecutive_scroll_only = 0
-                else:
-                    consecutive_scroll_only += 1
-
-                # If we've scrolled 5 times without doing anything useful, we're stuck
-                if consecutive_scroll_only >= 5:
-                    result["error"] = "Stuck scrolling — no actionable form fields found"
+                # Click Next/Submit/Continue
+                submitted = self._click_next_or_submit(page)
+                if not submitted:
+                    # Maybe we're done or stuck
+                    if self._check_blockers(page) == "success":
+                        result["success"] = True
+                        return result
+                    result["error"] = "Could not find Next/Submit button"
                     return result
 
-                page.wait_for_timeout(1500)
+                page.wait_for_timeout(3000)
                 result["pages"] += 1
 
-            result["error"] = "Max iterations reached"
+                # Check if we landed on success page
+                if self._check_blockers(page) == "success":
+                    result["success"] = True
+                    return result
+
+            result["error"] = "Max form pages reached"
             return result
 
         except Exception as e:
             result["error"] = str(e)[:200]
             return result
 
-    def _analyze_page(self, b64_image: str, job: dict, step: int) -> list[dict]:
-        """Send viewport screenshot to Claude Vision and get form-filling actions."""
+    # ---- Phase 1: Apply Button Discovery ----
+
+    def _click_apply_button(self, page: Page) -> bool:
+        """Find and click the Apply button using DOM selectors."""
+        for selector in APPLY_BUTTON_SELECTORS:
+            try:
+                el = page.locator(selector).first
+                if el.is_visible(timeout=500):
+                    el.scroll_into_view_if_needed()
+                    el.click()
+                    log.info(f"Clicked Apply button: {selector}")
+                    return True
+            except Exception:
+                continue
+
+        # Last resort: search all links/buttons for "apply" text
+        for tag in ["a", "button"]:
+            try:
+                elements = page.locator(tag).all()
+                for el in elements:
+                    try:
+                        text = el.inner_text(timeout=500).lower().strip()
+                        if "apply" in text and len(text) < 30:
+                            el.scroll_into_view_if_needed()
+                            el.click()
+                            log.info(f"Clicked Apply via text scan: '{text}'")
+                            return True
+                    except Exception:
+                        continue
+            except Exception:
+                continue
+
+        log.warning("No Apply button found via DOM")
+        return False
+
+    def _is_on_form(self, page: Page) -> bool:
+        """Check if current page already has a form (not just a job description)."""
+        try:
+            inputs = page.locator("form input, form textarea, form select").count()
+            return inputs >= 2
+        except Exception:
+            return False
+
+    # ---- Phase 2: DOM-based Form Filling ----
+
+    def _fill_form_via_dom(self, page: Page, resume_path: str, result: dict) -> int:
+        """Fill form fields by matching labels/names/placeholders to candidate data."""
+        filled = 0
+
+        # Find all input/textarea/select within forms
+        fields = self._get_form_fields(page)
+
+        for field_info in fields:
+            element = field_info["element"]
+            label_text = field_info["label"].lower()
+            input_type = field_info["type"]
+            name = field_info["name"].lower()
+
+            # Skip hidden, already filled, or file inputs (handled separately)
+            if input_type == "hidden":
+                continue
+            if input_type == "file":
+                self._upload_resume(element, resume_path, result)
+                continue
+
+            # Check if we should skip this field
+            combined = f"{label_text} {name}"
+            if any(re.search(pat, combined) for pat in SKIP_PATTERNS):
+                log.info(f"Skipping field: {label_text or name}")
+                continue
+
+            # Try to match to candidate data
+            value = self._match_field_value(combined)
+            if value and input_type in ("text", "email", "tel", "number", "url", ""):
+                try:
+                    element.clear()
+                    element.fill(value)
+                    filled += 1
+                    result["fields"] += 1
+                    log.info(f"DOM filled '{label_text or name}': {value[:40]}")
+                except Exception as e:
+                    log.warning(f"Failed to fill '{label_text or name}': {e}")
+
+            elif value and input_type == "select":
+                try:
+                    # Try exact match, then partial
+                    try:
+                        element.select_option(label=value)
+                    except Exception:
+                        element.select_option(value=value)
+                    filled += 1
+                    result["fields"] += 1
+                    log.info(f"DOM selected '{label_text or name}': {value}")
+                except Exception:
+                    pass
+
+        return filled
+
+    def _get_form_fields(self, page: Page) -> list[dict]:
+        """Extract form fields with their labels."""
+        fields = []
+        try:
+            # Get all visible inputs/textareas/selects
+            for selector in ["input", "textarea", "select"]:
+                elements = page.locator(f"form {selector}").all()
+                for el in elements:
+                    try:
+                        if not el.is_visible(timeout=300):
+                            continue
+                    except Exception:
+                        continue
+
+                    # Get field metadata
+                    try:
+                        attrs = el.evaluate("""el => ({
+                            type: el.type || el.tagName.toLowerCase(),
+                            name: el.name || '',
+                            id: el.id || '',
+                            placeholder: el.placeholder || '',
+                            ariaLabel: el.getAttribute('aria-label') || '',
+                            value: el.value || '',
+                        })""")
+                    except Exception:
+                        continue
+
+                    # Find label text
+                    label = ""
+                    field_id = attrs.get("id", "")
+                    if field_id:
+                        try:
+                            label_el = page.locator(f"label[for='{field_id}']").first
+                            label = label_el.inner_text(timeout=300)
+                        except Exception:
+                            pass
+
+                    if not label:
+                        label = attrs.get("ariaLabel", "") or attrs.get("placeholder", "")
+
+                    # Skip already-filled fields
+                    if attrs.get("value", "").strip():
+                        continue
+
+                    fields.append({
+                        "element": el,
+                        "label": label,
+                        "type": attrs.get("type", ""),
+                        "name": attrs.get("name", ""),
+                        "id": field_id,
+                    })
+        except Exception as e:
+            log.warning(f"Error scanning form fields: {e}")
+
+        return fields
+
+    def _match_field_value(self, field_text: str) -> str:
+        """Match a field label/name to candidate data using FIELD_MAP."""
+        for pattern, value in FIELD_MAP.items():
+            if re.search(pattern, field_text):
+                return str(value)
+        return ""
+
+    def _upload_resume(self, element: Locator, resume_path: str, result: dict):
+        """Upload resume file."""
+        import os
+        if resume_path and os.path.exists(resume_path):
+            try:
+                element.set_input_files(resume_path)
+                result["resume_uploaded"] = True
+                log.info("Uploaded resume via DOM")
+            except Exception as e:
+                log.warning(f"Resume upload failed: {e}")
+
+    def _get_unfilled_fields(self, page: Page) -> list[dict]:
+        """Find form fields that are still empty (DOM filling missed them)."""
+        unfilled = []
+        try:
+            fields = self._get_form_fields(page)
+            for f in fields:
+                if f["type"] not in ("hidden", "file", "submit", "button", "checkbox", "radio"):
+                    unfilled.append(f)
+        except Exception:
+            pass
+        return unfilled
+
+    # ---- Phase 3: Vision Fallback ----
+
+    def _fill_with_vision(self, page: Page, job: dict, resume_path: str, result: dict, unfilled: list) -> int:
+        """Use Claude Vision for fields that DOM parsing couldn't handle."""
+        # Take viewport screenshot
+        screenshot = page.screenshot(type="png")
+        b64_image = base64.b64encode(screenshot).decode()
+
+        # Build description of unfilled fields
+        field_descriptions = []
+        for f in unfilled[:10]:  # Cap at 10
+            field_descriptions.append(f"- '{f['label'] or f['name']}' (type={f['type']}, name={f['name']})")
+        fields_text = "\n".join(field_descriptions) if field_descriptions else "Unknown fields visible"
+
         candidate_info = json.dumps({
             "name": f"{CANDIDATE['first_name']} {CANDIDATE['last_name']}",
             "email": CANDIDATE["email"],
@@ -124,36 +371,26 @@ class VisionApplicator:
             "education": f"{CANDIDATE['degree']} - {CANDIDATE['university']} ({CANDIDATE['graduation_year']})",
         }, indent=2)
 
-        prompt = f"""You are an automated job application assistant. This is a screenshot of what is CURRENTLY VISIBLE in the browser viewport (step {step + 1}).
+        prompt = f"""You are filling a job application form. The DOM parser already filled standard fields but these remain empty:
+
+{fields_text}
 
 Candidate data:
 {candidate_info}
 
-Return a JSON array of actions. Each action:
+Looking at the screenshot, return a JSON array of actions for ONLY the unfilled fields:
 {{
-  "selector": "CSS selector for the element",
-  "action": "fill" | "click" | "select" | "upload" | "scroll" | "skip",
-  "value": "value to enter (for fill/select) or scroll direction (for scroll)",
-  "description": "what this field/action is"
+  "selector": "CSS selector using id, name, or class (NO :contains or jQuery)",
+  "action": "fill" | "select" | "skip",
+  "value": "value to fill",
+  "description": "field description"
 }}
 
-SELECTOR RULES (CRITICAL):
-- Use ONLY standard CSS selectors. NEVER use :contains(), :has-text(), :visible, or jQuery.
-- Target by id, name, class, type, aria-label, data-testid, or placeholder.
-  Good: input[name="email"], #first-name, button[type="submit"], textarea.cover-letter
-  Bad: button:contains("Apply"), input:visible
-- If unsure of exact selector, use Playwright text selectors: "button >> text=Apply Now"
-
-WHAT TO DO:
-- If you see form fields: fill them with candidate data and return fill actions.
-- If you see a button (Apply, Next, Continue, Submit): return a click action for it.
-- If the page shows a job description and you need to scroll down to find the Apply button or form: return {{"selector": "body", "action": "scroll", "value": "down", "description": "Scroll to find Apply button/form"}}
-- If you see "Apply Now", "Quick Apply", "Easy Apply" button: click it immediately.
-- For file upload (resume): use action "upload".
-- Skip salary fields, cover letter, and questions you cannot answer.
-
-IMPORTANT: Only act on what you can SEE in this screenshot. Do not guess about off-screen elements.
-Return ONLY the JSON array, no other text."""
+Rules:
+- Use input[name="..."] or input[id="..."] selectors only
+- Skip salary, cover letter, demographic, and "how did you hear" fields
+- For open-ended questions, provide a brief professional answer
+- Return ONLY the JSON array"""
 
         try:
             response = self.claude.messages.create(
@@ -170,104 +407,36 @@ Return ONLY the JSON array, no other text."""
             text = response.content[0].text.strip()
             text = text.replace("```json", "").replace("```", "").strip()
             actions = json.loads(text) if text.startswith("[") else []
-            log.info(f"Vision returned {len(actions)} actions")
-            return actions
-        except json.JSONDecodeError as e:
-            log.error(f"Vision returned invalid JSON: {e}")
-            return []
         except Exception as e:
             log.error(f"Vision analysis failed: {e}")
-            return []
+            return 0
 
-    def _sanitize_selector(self, selector: str) -> str:
-        """Strip invalid jQuery pseudo-selectors that Playwright doesn't support."""
-        sanitized = re.sub(r':contains\(["\']?[^)]*["\']?\)', '', selector)
-        sanitized = re.sub(r':has-text\(["\']?[^)]*["\']?\)', '', sanitized)
-        sanitized = re.sub(r':visible', '', sanitized)
-        sanitized = re.sub(r':first\b', '', sanitized)
-        sanitized = sanitized.strip().rstrip(',')
-        return sanitized if sanitized else selector
+        # Execute Vision actions
+        filled = 0
+        for action in actions:
+            if self._execute_vision_action(page, action, job, result):
+                filled += 1
+        return filled
 
-    def _find_element(self, page: Page, selector: str, desc: str):
-        """Try to find element with sanitized selector, then fallback strategies."""
-        clean = self._sanitize_selector(selector)
-
-        # Try primary selector
-        try:
-            el = page.locator(clean).first
-            if el.is_visible(timeout=2000):
-                return el
-        except Exception:
-            pass
-
-        # Try Playwright text selector if it looks like one
-        if ">>" in selector:
-            try:
-                el = page.locator(selector).first
-                if el.is_visible(timeout=2000):
-                    return el
-            except Exception:
-                pass
-
-        # Fallback for buttons: try common patterns
-        desc_lower = (desc or "").lower()
-        if any(kw in desc_lower for kw in ["apply", "submit", "next", "continue", "button"]):
-            fallbacks = [
-                "button[type='submit']", "input[type='submit']",
-                "button.btn-primary", "a.apply-button", "a.btn-primary",
-            ]
-            # Also try text-based Playwright selectors
-            for word in ["Apply", "Apply Now", "Submit", "Next", "Continue"]:
-                fallbacks.append(f"button >> text={word}")
-                fallbacks.append(f"a >> text={word}")
-
-            for fb in fallbacks:
-                try:
-                    el = page.locator(fb).first
-                    if el.is_visible(timeout=800):
-                        log.info(f"Fallback matched: {fb}")
-                        return el
-                except Exception:
-                    continue
-
-        log.warning(f"Element not found: {clean}")
-        return None
-
-    def _execute_action(self, page: Page, action: dict, resume_path: str, job: dict, result: dict) -> bool:
-        """Execute a single action from Claude Vision."""
+    def _execute_vision_action(self, page: Page, action: dict, job: dict, result: dict) -> bool:
+        """Execute a single Vision-suggested action."""
         try:
             selector = action.get("selector", "")
             act = action.get("action", "")
             value = action.get("value", "")
             desc = action.get("description", "")
 
-            if act == "skip":
+            if act == "skip" or not selector:
                 return False
 
-            if act == "scroll":
-                direction = (value or "down").lower()
-                scroll_amount = 700  # roughly one viewport height
-                if direction == "down":
-                    page.evaluate(f"window.scrollBy(0, {scroll_amount})")
-                elif direction == "up":
-                    page.evaluate(f"window.scrollBy(0, -{scroll_amount})")
-                elif direction == "bottom":
-                    page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-                elif direction == "top":
-                    page.evaluate("window.scrollTo(0, 0)")
-                log.info(f"Scrolled {direction}: {desc}")
-                page.wait_for_timeout(1000)
-                return True  # scroll counts as executed but not as a "real action"
+            # Sanitize selector
+            selector = re.sub(r':contains\([^)]*\)', '', selector)
+            selector = re.sub(r':has-text\([^)]*\)', '', selector)
+            selector = re.sub(r':visible', '', selector).strip()
 
-            element = self._find_element(page, selector, desc)
-            if not element:
+            el = page.locator(selector).first
+            if not el.is_visible(timeout=2000):
                 return False
-
-            # Scroll element into view
-            try:
-                element.scroll_into_view_if_needed(timeout=3000)
-            except Exception:
-                pass
 
             if act == "fill":
                 if self.notes_client and _is_open_question(desc):
@@ -276,36 +445,89 @@ Return ONLY the JSON array, no other text."""
                     )
                     if answer:
                         value = answer
-                element.clear()
-                element.fill(value)
-                log.info(f"Filled '{desc}': {value[:50]}...")
-                return True
-
-            elif act == "click":
-                element.click()
-                page.wait_for_timeout(1500)
-                log.info(f"Clicked: {desc}")
+                el.clear()
+                el.fill(value)
+                result["fields"] += 1
+                log.info(f"Vision filled '{desc}': {value[:40]}")
                 return True
 
             elif act == "select":
                 try:
-                    element.select_option(label=value)
+                    el.select_option(label=value)
                 except Exception:
-                    element.select_option(value=value)
-                log.info(f"Selected '{desc}': {value}")
+                    el.select_option(value=value)
+                result["fields"] += 1
+                log.info(f"Vision selected '{desc}': {value}")
                 return True
 
-            elif act == "upload":
-                import os
-                if os.path.exists(resume_path):
-                    element.set_input_files(resume_path)
-                    result["resume_uploaded"] = True
-                    log.info("Uploaded resume")
-                    return True
-
         except Exception as e:
-            log.warning(f"Action failed ({action.get('description', '')}): {e}")
+            log.warning(f"Vision action failed ({action.get('description', '')}): {e}")
         return False
+
+    # ---- Navigation ----
+
+    def _click_next_or_submit(self, page: Page) -> bool:
+        """Find and click Submit/Next/Continue button."""
+        selectors = [
+            "button[type='submit']", "input[type='submit']",
+            "button >> text=Submit", "button >> text=Next",
+            "button >> text=Continue", "button >> text=Save",
+            "button >> text=Submit Application",
+            "a >> text=Submit", "a >> text=Next", "a >> text=Continue",
+            "button.btn-primary", "button.submit-btn",
+        ]
+        for sel in selectors:
+            try:
+                el = page.locator(sel).first
+                if el.is_visible(timeout=500):
+                    el.scroll_into_view_if_needed()
+                    el.click()
+                    log.info(f"Clicked next/submit: {sel}")
+                    return True
+            except Exception:
+                continue
+
+        # Fallback: scan all buttons
+        try:
+            buttons = page.locator("button, input[type='submit']").all()
+            for btn in buttons:
+                try:
+                    text = btn.inner_text(timeout=300).lower().strip()
+                    if any(kw in text for kw in ["submit", "next", "continue", "apply", "save"]):
+                        btn.scroll_into_view_if_needed()
+                        btn.click()
+                        log.info(f"Clicked via text scan: '{text}'")
+                        return True
+                except Exception:
+                    continue
+        except Exception:
+            pass
+
+        return False
+
+    def _check_blockers(self, page: Page) -> str | None:
+        """Check for blockers or success. Returns 'success', error string, or None."""
+        try:
+            page_text = page.inner_text("body").lower()
+        except Exception:
+            return None
+
+        # Success
+        success_phrases = ["application submitted", "thank you for applying",
+                           "successfully applied", "application received",
+                           "application has been submitted", "you have applied"]
+        if any(p in page_text for p in success_phrases):
+            return "success"
+
+        # Blockers
+        if "captcha" in page_text or "verify you are human" in page_text:
+            return "CAPTCHA detected"
+        if "please sign in" in page_text[:1000] or "sign in to apply" in page_text[:1000]:
+            return "Login wall detected"
+        if "this job is no longer available" in page_text or "position has been filled" in page_text:
+            return "Job no longer available"
+
+        return None
 
 
 def _is_open_question(description: str) -> bool:
