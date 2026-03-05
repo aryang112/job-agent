@@ -4,7 +4,7 @@ import time
 import sys
 import os
 from playwright.sync_api import sync_playwright
-from playwright_stealth import stealth_sync
+from playwright_stealth import Stealth
 
 from supabase_client import SupabaseOps
 from applicator import Applicator
@@ -60,7 +60,7 @@ def main():
         )
         page = context.pages[0] if context.pages else context.new_page()
         # Apply stealth patches (hides navigator.webdriver, chrome.runtime, etc.)
-        stealth_sync(page)
+        Stealth().apply_stealth_sync(page)
 
         while True:
             try:
