@@ -662,22 +662,35 @@ Rules:
         try:
             response = self.claude.messages.create(
                 model="claude-sonnet-4-20250514",
-                max_tokens=200,
+                max_tokens=300,
                 messages=[{
                     "role": "user",
                     "content": [
                         {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": b64_image}},
-                        {"type": "text", "text": """Find the Cloudflare "Verify you are human" checkbox or clickable element on this page.
-Return ONLY a JSON object with the pixel coordinates of where to click:
-{"x": <number>, "y": <number>, "description": "<what you see>"}
-The coordinates should be the CENTER of the checkbox/button to click.
-If you cannot find it, return: {"x": -1, "y": -1, "description": "not found"}"""}
+                        {"type": "text", "text": """Look at this screenshot. There is a Cloudflare "Verify you are human" challenge on this page.
+
+Find the checkbox, button, or clickable widget that I need to click to verify.
+
+IMPORTANT: The viewport is 1280x900 pixels. Return the PIXEL COORDINATES of where to click.
+
+Return ONLY this JSON (no explanation, no markdown):
+{"x": 123, "y": 456, "description": "the checkbox"}
+
+If you truly cannot find any clickable verification element, return:
+{"x": -1, "y": -1, "description": "not found"}"""}
                     ]
                 }]
             )
             text = response.content[0].text.strip()
+            # Clean up common Claude formatting issues
             text = text.replace("```json", "").replace("```", "").strip()
-            result = json.loads(text)
+            # Try to extract JSON from the response even if there's surrounding text
+            json_match = re.search(r'\{[^}]+\}', text)
+            if not json_match:
+                log.warning(f"Vision returned non-JSON: {text[:100]}")
+                return None
+
+            result = json.loads(json_match.group())
             x, y = result.get("x", -1), result.get("y", -1)
             desc = result.get("description", "")
             if x > 0 and y > 0:
@@ -686,6 +699,9 @@ If you cannot find it, return: {"x": -1, "y": -1, "description": "not found"}"""
             else:
                 log.warning(f"Vision couldn't find checkbox: {desc}")
                 return None
+        except json.JSONDecodeError as e:
+            log.warning(f"Vision returned invalid JSON: {e}")
+            return None
         except Exception as e:
             log.error(f"Vision Cloudflare detection failed: {e}")
             return None
