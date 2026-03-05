@@ -7,6 +7,8 @@ Phase 3: Only use Claude Vision for fields the DOM parser can't figure out.
 """
 import base64
 import json
+import math
+import random
 import re
 import anthropic
 from playwright.sync_api import Page, Locator
@@ -610,57 +612,104 @@ Rules:
 
         return self._click_picked_element(page, picked)
 
+    def _human_mouse_move(self, page: Page, target_x: float, target_y: float):
+        """Simulate human-like mouse movement with a curved path and variable speed."""
+        # Start from a random spot (or current position approximation)
+        start_x = random.randint(100, 400)
+        start_y = random.randint(100, 300)
+
+        # Generate a bezier-ish curve with some noise
+        steps = random.randint(25, 45)
+        for i in range(steps + 1):
+            t = i / steps
+            # Ease-in-out curve
+            t_smooth = t * t * (3 - 2 * t)
+            # Add slight random wobble
+            wobble_x = random.gauss(0, 2)
+            wobble_y = random.gauss(0, 1.5)
+            # Bezier midpoint offset for natural arc
+            mid_offset_x = random.uniform(-30, 30) * math.sin(math.pi * t)
+            mid_offset_y = random.uniform(-20, 20) * math.sin(math.pi * t)
+
+            x = start_x + (target_x - start_x) * t_smooth + mid_offset_x + wobble_x
+            y = start_y + (target_y - start_y) * t_smooth + mid_offset_y + wobble_y
+
+            page.mouse.move(x, y)
+            # Variable delay — slower at start/end, faster in middle
+            delay = random.uniform(5, 20) if 0.2 < t < 0.8 else random.uniform(15, 40)
+            page.wait_for_timeout(delay)
+
+    def _vision_find_checkbox(self, page: Page) -> tuple[float, float] | None:
+        """Use Claude Vision to find the exact pixel coordinates of the Cloudflare checkbox."""
+        screenshot = page.screenshot(type="png")
+        b64_image = base64.b64encode(screenshot).decode()
+
+        try:
+            response = self.claude.messages.create(
+                model="claude-sonnet-4-20250514",
+                max_tokens=200,
+                messages=[{
+                    "role": "user",
+                    "content": [
+                        {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": b64_image}},
+                        {"type": "text", "text": """Find the Cloudflare "Verify you are human" checkbox or clickable element on this page.
+Return ONLY a JSON object with the pixel coordinates of where to click:
+{"x": <number>, "y": <number>, "description": "<what you see>"}
+The coordinates should be the CENTER of the checkbox/button to click.
+If you cannot find it, return: {"x": -1, "y": -1, "description": "not found"}"""}
+                    ]
+                }]
+            )
+            text = response.content[0].text.strip()
+            text = text.replace("```json", "").replace("```", "").strip()
+            result = json.loads(text)
+            x, y = result.get("x", -1), result.get("y", -1)
+            desc = result.get("description", "")
+            if x > 0 and y > 0:
+                log.info(f"Vision found Cloudflare checkbox at ({x}, {y}): {desc}")
+                return (x, y)
+            else:
+                log.warning(f"Vision couldn't find checkbox: {desc}")
+                return None
+        except Exception as e:
+            log.error(f"Vision Cloudflare detection failed: {e}")
+            return None
+
     def _wait_for_cloudflare(self, page: Page) -> bool:
-        """Wait for Cloudflare Turnstile/challenge to auto-resolve. Returns True if cleared."""
-        log.info("Cloudflare challenge detected — waiting for auto-resolve...")
+        """Handle Cloudflare Turnstile using Vision + human-like mouse movement."""
+        log.info("Cloudflare challenge detected — attempting to solve...")
 
-        # First, try to click the Turnstile checkbox (it's inside an iframe)
-        clicked_checkbox = False
-        for i in range(25):  # Wait up to ~25 seconds
-            page.wait_for_timeout(1000)
+        # Wait a couple seconds for the challenge to fully render
+        page.wait_for_timeout(2000)
+
+        # Try up to 3 times to find and click the checkbox
+        for attempt in range(3):
+            # Use Vision to find the checkbox coordinates
+            coords = self._vision_find_checkbox(page)
+            if not coords:
+                page.wait_for_timeout(2000)
+                continue
+
+            x, y = coords
+            # Add slight random offset so we don't click dead center every time
+            x += random.uniform(-3, 3)
+            y += random.uniform(-3, 3)
+
+            # Simulate human mouse movement to the checkbox
+            self._human_mouse_move(page, x, y)
+
+            # Small pause like a human would before clicking
+            page.wait_for_timeout(random.randint(100, 400))
+
+            # Click
+            page.mouse.click(x, y)
+            log.info(f"Clicked Cloudflare checkbox at ({x:.0f}, {y:.0f})")
+
+            # Wait for it to process
+            page.wait_for_timeout(5000)
+
+            # Check if cleared
             try:
-                # Turnstile checkbox lives inside an iframe — search all frames
-                if not clicked_checkbox:
-                    for frame in page.frames:
-                        try:
-                            # Turnstile iframe URL contains "challenges.cloudflare.com"
-                            if "cloudflare" in (frame.url or "").lower() or "turnstile" in (frame.url or "").lower():
-                                checkbox = frame.locator("input[type='checkbox'], .cb-lb, #challenge-stage").first
-                                if checkbox.is_visible(timeout=500):
-                                    checkbox.click()
-                                    clicked_checkbox = True
-                                    log.info("Clicked Cloudflare Turnstile checkbox in iframe")
-                                    page.wait_for_timeout(3000)
-                                    break
-                        except Exception:
-                            continue
-
-                    # Also try clicking the Turnstile widget div on the main page
-                    # (sometimes it's a clickable div wrapping the iframe)
-                    if not clicked_checkbox:
-                        for selector in [
-                            "iframe[src*='cloudflare']",
-                            "iframe[src*='turnstile']",
-                            "[class*='turnstile']",
-                            "[id*='turnstile']",
-                            "[class*='cf-turnstile']",
-                            "#cf-turnstile",
-                        ]:
-                            try:
-                                el = page.locator(selector).first
-                                if el.is_visible(timeout=300):
-                                    # Click the center of the iframe/widget
-                                    box = el.bounding_box()
-                                    if box:
-                                        page.mouse.click(box["x"] + box["width"] / 2, box["y"] + box["height"] / 2)
-                                        clicked_checkbox = True
-                                        log.info(f"Clicked Turnstile widget via: {selector}")
-                                        page.wait_for_timeout(3000)
-                                        break
-                            except Exception:
-                                continue
-
-                # Check if challenge cleared
                 page_text = page.inner_text("body").lower()
                 challenge_gone = (
                     "verify you are human" not in page_text
@@ -668,13 +717,15 @@ Rules:
                     and "just a moment" not in page_text
                 )
                 if challenge_gone:
-                    log.info(f"Cloudflare cleared after {i + 1}s")
+                    log.info(f"Cloudflare cleared on attempt {attempt + 1}")
                     return True
-
             except Exception:
                 pass
 
-        log.warning("Cloudflare challenge did not auto-resolve after 25s")
+            log.warning(f"Cloudflare attempt {attempt + 1} — challenge still present")
+            page.wait_for_timeout(3000)
+
+        log.warning("Cloudflare challenge could not be solved after 3 attempts")
         return False
 
     def _check_blockers(self, page: Page) -> str | None:
