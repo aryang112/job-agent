@@ -10,6 +10,7 @@ import json
 import math
 import random
 import re
+import time
 import anthropic
 from playwright.sync_api import Page, Locator
 from field_mapper import CANDIDATE, get_field_value
@@ -59,9 +60,10 @@ SKIP_PATTERNS = [
 
 
 class VisionApplicator:
-    def __init__(self, api_key: str, notes_client=None):
+    def __init__(self, api_key: str, notes_client=None, capsolver_key: str = ""):
         self.claude = anthropic.Anthropic(api_key=api_key)
         self.notes_client = notes_client
+        self.capsolver_key = capsolver_key
 
     def apply(self, page: Page, job: dict, resume_path: str) -> dict:
         result = {"success": False, "pages": 0, "fields": 0, "resume_uploaded": False, "error": None}
@@ -78,7 +80,7 @@ class VisionApplicator:
             result["pages"] += 1
 
             # --- Phase 0: Check for Cloudflare on initial load ---
-            blocker = self._check_blockers(page)
+            blocker = self._check_blockers(page, job)
             if blocker == "success":
                 result["success"] = True
                 return result
@@ -95,11 +97,20 @@ class VisionApplicator:
                 page.wait_for_timeout(3000)
                 result["pages"] += 1
 
+                # Cloudflare check after navigation (Apply button may redirect)
+                blocker = self._check_blockers(page, job)
+                if blocker == "success":
+                    result["success"] = True
+                    return result
+                if blocker:
+                    result["error"] = blocker
+                    return result
+
             # --- Phase 2+3: Fill form (DOM-first, Vision-fallback) ---
             max_pages = 10
             for page_num in range(max_pages):
                 # Check blockers
-                blocker = self._check_blockers(page)
+                blocker = self._check_blockers(page, job)
                 if blocker == "success":
                     result["success"] = True
                     log.info("Application submitted successfully!")
@@ -123,7 +134,7 @@ class VisionApplicator:
                 submitted = self._click_next_or_submit(page)
                 if not submitted:
                     # Maybe we're done or stuck
-                    if self._check_blockers(page) == "success":
+                    if self._check_blockers(page, job) == "success":
                         result["success"] = True
                         return result
                     result["error"] = "Could not find Next/Submit button"
@@ -132,9 +143,13 @@ class VisionApplicator:
                 page.wait_for_timeout(3000)
                 result["pages"] += 1
 
-                # Check if we landed on success page
-                if self._check_blockers(page) == "success":
+                # Cloudflare/blocker check after every page navigation
+                blocker = self._check_blockers(page, job)
+                if blocker == "success":
                     result["success"] = True
+                    return result
+                if blocker:
+                    result["error"] = blocker
                     return result
 
             result["error"] = "Max form pages reached"
@@ -675,61 +690,155 @@ If you cannot find it, return: {"x": -1, "y": -1, "description": "not found"}"""
             log.error(f"Vision Cloudflare detection failed: {e}")
             return None
 
-    def _wait_for_cloudflare(self, page: Page) -> bool:
-        """Handle Cloudflare Turnstile using Vision + human-like mouse movement."""
-        log.info("Cloudflare challenge detected — attempting to solve...")
+    def _is_cloudflare_present(self, page: Page) -> bool:
+        """Quick check if Cloudflare challenge is on the page."""
+        try:
+            page_text = page.inner_text("body").lower()
+            return any(p in page_text for p in [
+                "verify you are human", "checking your browser",
+                "just a moment", "cloudflare",
+            ])
+        except Exception:
+            return False
 
-        # Wait a couple seconds for the challenge to fully render
+    def _wait_for_cloudflare(self, page: Page, use_capsolver: bool = False) -> bool:
+        """Handle Cloudflare Turnstile: Vision+mouse first, CapSolver fallback for high-value jobs."""
+        log.info("Cloudflare challenge detected — attempting to solve...")
         page.wait_for_timeout(2000)
 
-        # Try up to 3 times to find and click the checkbox
+        # --- Attempt 1-3: Vision + human mouse ---
         for attempt in range(3):
-            # Use Vision to find the checkbox coordinates
             coords = self._vision_find_checkbox(page)
             if not coords:
                 page.wait_for_timeout(2000)
                 continue
 
             x, y = coords
-            # Add slight random offset so we don't click dead center every time
             x += random.uniform(-3, 3)
             y += random.uniform(-3, 3)
 
-            # Simulate human mouse movement to the checkbox
+            # Human-like mouse movement to the checkbox
             self._human_mouse_move(page, x, y)
-
-            # Small pause like a human would before clicking
             page.wait_for_timeout(random.randint(100, 400))
-
-            # Click
             page.mouse.click(x, y)
-            log.info(f"Clicked Cloudflare checkbox at ({x:.0f}, {y:.0f})")
+            log.info(f"Clicked Cloudflare checkbox at ({x:.0f}, {y:.0f}) — attempt {attempt + 1}")
 
-            # Wait for it to process
             page.wait_for_timeout(5000)
 
-            # Check if cleared
-            try:
-                page_text = page.inner_text("body").lower()
-                challenge_gone = (
-                    "verify you are human" not in page_text
-                    and "checking your browser" not in page_text
-                    and "just a moment" not in page_text
-                )
-                if challenge_gone:
-                    log.info(f"Cloudflare cleared on attempt {attempt + 1}")
-                    return True
-            except Exception:
-                pass
+            if not self._is_cloudflare_present(page):
+                log.info(f"Cloudflare cleared via Vision+mouse on attempt {attempt + 1}")
+                return True
 
-            log.warning(f"Cloudflare attempt {attempt + 1} — challenge still present")
-            page.wait_for_timeout(3000)
+            log.warning(f"Cloudflare still present after attempt {attempt + 1}")
+            page.wait_for_timeout(2000)
 
-        log.warning("Cloudflare challenge could not be solved after 3 attempts")
+        # --- Attempt 4: CapSolver paid fallback (only if enabled + high-value) ---
+        if use_capsolver and self.capsolver_key:
+            log.info("Trying CapSolver as paid fallback...")
+            if self._solve_with_capsolver(page):
+                return True
+
+        log.warning("Cloudflare challenge could not be solved")
         return False
 
-    def _check_blockers(self, page: Page) -> str | None:
-        """Check for blockers or success. Returns 'success', error string, or None."""
+    def _solve_with_capsolver(self, page: Page) -> bool:
+        """Use CapSolver API to solve Cloudflare Turnstile. Returns True if solved."""
+        try:
+            import requests
+
+            # Find the Turnstile sitekey from the page
+            sitekey = page.evaluate("""() => {
+                const el = document.querySelector('[data-sitekey]') ||
+                           document.querySelector('iframe[src*="turnstile"]');
+                if (el) return el.getAttribute('data-sitekey') || '';
+                // Try to extract from iframe src
+                const iframes = document.querySelectorAll('iframe');
+                for (const f of iframes) {
+                    const match = (f.src || '').match(/sitekey=([^&]+)/);
+                    if (match) return match[1];
+                }
+                return '';
+            }""")
+
+            if not sitekey:
+                log.warning("CapSolver: could not find Turnstile sitekey")
+                return False
+
+            page_url = page.url
+            log.info(f"CapSolver: solving Turnstile (sitekey={sitekey[:20]}...)")
+
+            # Create task
+            resp = requests.post("https://api.capsolver.com/createTask", json={
+                "clientKey": self.capsolver_key,
+                "task": {
+                    "type": "AntiTurnstileTaskProxyLess",
+                    "websiteURL": page_url,
+                    "websiteKey": sitekey,
+                }
+            }, timeout=10)
+            task_data = resp.json()
+            task_id = task_data.get("taskId")
+            if not task_id:
+                log.warning(f"CapSolver: failed to create task: {task_data}")
+                return False
+
+            # Poll for result (max 60s)
+            for _ in range(30):
+                time.sleep(2)
+                resp = requests.post("https://api.capsolver.com/getTaskResult", json={
+                    "clientKey": self.capsolver_key,
+                    "taskId": task_id,
+                }, timeout=10)
+                result = resp.json()
+                status = result.get("status")
+                if status == "ready":
+                    token = result.get("solution", {}).get("token", "")
+                    if token:
+                        # Inject the token into Turnstile callback
+                        page.evaluate(f"""(token) => {{
+                            // Try standard Turnstile callback
+                            if (window.turnstile) {{
+                                const widgets = document.querySelectorAll('[data-sitekey]');
+                                widgets.forEach(w => {{
+                                    const id = w.getAttribute('data-turnstile-id') || w.id;
+                                    if (id) window.turnstile.execute(id);
+                                }});
+                            }}
+                            // Inject into hidden input
+                            const inputs = document.querySelectorAll('input[name*="turnstile"], input[name*="cf-"], input[name="cf-turnstile-response"]');
+                            inputs.forEach(i => {{ i.value = token; }});
+                            // Try callback function
+                            if (typeof window._cf_chl_opt !== 'undefined') {{
+                                const form = document.querySelector('form');
+                                if (form) form.submit();
+                            }}
+                        }}""", token)
+                        log.info("CapSolver: token injected successfully")
+                        page.wait_for_timeout(3000)
+
+                        if not self._is_cloudflare_present(page):
+                            log.info("CapSolver: Cloudflare cleared!")
+                            return True
+                        log.warning("CapSolver: token injected but challenge persists")
+                        return False
+
+                elif status == "failed":
+                    log.warning(f"CapSolver: task failed: {result}")
+                    return False
+
+            log.warning("CapSolver: timed out")
+            return False
+
+        except ImportError:
+            log.warning("CapSolver: 'requests' package not installed")
+            return False
+        except Exception as e:
+            log.error(f"CapSolver failed: {e}")
+            return False
+
+    def _check_blockers(self, page: Page, job: dict = None) -> str | None:
+        """Check for blockers or success. Returns 'success', error string, or None.
+        Runs Cloudflare check after every navigation."""
         try:
             page_text = page.inner_text("body").lower()
         except Exception:
@@ -742,15 +851,18 @@ If you cannot find it, return: {"x": -1, "y": -1, "description": "not found"}"""
         if any(p in page_text for p in success_phrases):
             return "success"
 
-        # Cloudflare Turnstile — wait for auto-resolve instead of immediately failing
-        cloudflare_phrases = ["verify you are human", "checking your browser",
-                              "just a moment", "cloudflare"]
-        if any(p in page_text for p in cloudflare_phrases):
-            if self._wait_for_cloudflare(page):
-                return None  # Cleared — continue normally
+        # Cloudflare Turnstile — try to solve it
+        if self._is_cloudflare_present(page):
+            # Use CapSolver only for high-value jobs (score >= 85)
+            job_score = (job or {}).get("score", 0) or 0
+            use_capsolver = job_score >= 85
+            if use_capsolver and self.capsolver_key:
+                log.info(f"High-value job (score={job_score}) — CapSolver enabled as fallback")
+            if self._wait_for_cloudflare(page, use_capsolver=use_capsolver):
+                return None  # Cleared
             return "Cloudflare challenge (not auto-resolved)"
 
-        # Other CAPTCHAs (reCAPTCHA etc.) — can't solve these
+        # Other CAPTCHAs (reCAPTCHA etc.)
         if "captcha" in page_text:
             return "CAPTCHA detected"
 

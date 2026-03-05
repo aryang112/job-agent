@@ -2,6 +2,7 @@
   "anthropic_api_key": "sk-ant-...",
   "supabase_url": "https://your-project.supabase.co",
   "supabase_service_key": "eyJ...",
+  "capsolver_api_key": "",
   "resume_path": "C:\\Users\\14432\\Documents\\Resume\\Aryan_Gupta_Backend_SDETResume.docx",
   "linkedin_url": "",
   "throttle": {

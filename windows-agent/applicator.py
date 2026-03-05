@@ -6,8 +6,8 @@ from logger import log
 
 
 class Applicator:
-    def __init__(self, api_key: str, notes_client=None):
-        self.vision = VisionApplicator(api_key, notes_client)
+    def __init__(self, api_key: str, notes_client=None, capsolver_key: str = ""):
+        self.vision = VisionApplicator(api_key, notes_client, capsolver_key=capsolver_key)
 
     def apply_to_job(self, page, job: dict, resume_path: str) -> dict:
         """
